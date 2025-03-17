@@ -4,20 +4,26 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"text/template"
 	"time"
 
-	"github.com/AdguardTeam/golibs/log"
-	"golang.org/x/exp/slices"
+	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 )
 
 func main() {
+	ctx := context.Background()
+	l := slogutil.New(nil)
+
 	urlStr := "https://adguardteam.github.io/HostlistsRegistry/assets/services.json"
 	if v, ok := os.LookupEnv("URL"); ok {
 		urlStr = v
@@ -25,15 +31,14 @@ func main() {
 
 	// Validate the URL.
 	_, err := url.Parse(urlStr)
-	check(err)
+	errors.Check(err)
 
 	c := &http.Client{
 		Timeout: 10 * time.Second,
 	}
 
-	resp, err := c.Get(urlStr)
-	check(err)
-	defer log.OnCloserError(resp.Body, log.ERROR)
+	resp := errors.Must(c.Get(urlStr))
+	defer slogutil.CloseAndLog(ctx, l, resp.Body, slog.LevelError)
 
 	if resp.StatusCode != http.StatusOK {
 		panic(fmt.Errorf("expected code %d, got %d", http.StatusOK, resp.StatusCode))
@@ -41,7 +46,7 @@ func main() {
 
 	hlSvcs := &hlServices{}
 	err = json.NewDecoder(resp.Body).Decode(hlSvcs)
-	check(err)
+	errors.Check(err)
 
 	// Sort all services and rules to make the output more predictable.
 	slices.SortStableFunc(hlSvcs.BlockedServices, func(a, b *hlServicesService) (res int) {
@@ -54,20 +59,20 @@ func main() {
 	// Use another set of delimiters to prevent them interfering with the Go
 	// code.
 	tmpl, err := template.New("main").Delims("<%", "%>").Funcs(template.FuncMap{
-		"isnotlast": func(idx, sliceLen int) (ok bool) { return idx != sliceLen-1 },
+		"isnotlast": func(idx, sliceLen int) (ok bool) {
+			return idx != sliceLen-1
+		},
 	}).Parse(tmplStr)
-	check(err)
+	errors.Check(err)
 
-	f, err := os.OpenFile(
+	f := errors.Must(os.OpenFile(
 		"./internal/filtering/servicelist.go",
 		os.O_CREATE|os.O_TRUNC|os.O_WRONLY,
 		0o644,
-	)
-	check(err)
-	defer log.OnCloserError(f, log.ERROR)
+	))
+	defer slogutil.CloseAndLog(ctx, l, f, slog.LevelError)
 
-	err = tmpl.Execute(f, hlSvcs)
-	check(err)
+	errors.Check(tmpl.Execute(f, hlSvcs))
 }
 
 // tmplStr is the template for the Go source file with the services.
@@ -94,13 +99,6 @@ var blockedServices = []blockedService{<% $l := len .BlockedServices %>
 	},
 }<% if isnotlast $i $l %>, <% end %><% end %>}
 `
-
-// check is a simple error-checking helper for scripts.
-func check(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
 
 // hlServices is the JSON structure for the Hostlists Registry blocked service
 // index.

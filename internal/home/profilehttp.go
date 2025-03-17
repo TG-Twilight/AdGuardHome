@@ -14,7 +14,7 @@ type Theme string
 
 // Allowed [Theme] values.
 //
-// Keep in sync with client/src/helpers/constants.js.
+// Keep in sync with client/src/helpers/constants.ts.
 const (
 	ThemeAuto  Theme = "auto"
 	ThemeLight Theme = "light"
@@ -47,7 +47,7 @@ type profileJSON struct {
 
 // handleGetProfile is the handler for GET /control/profile endpoint.
 func handleGetProfile(w http.ResponseWriter, r *http.Request) {
-	u := Context.auth.getCurrentUser(r)
+	u := globalContext.auth.getCurrentUser(r)
 
 	var resp profileJSON
 	func() {

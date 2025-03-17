@@ -10,10 +10,9 @@ import (
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/next/agh"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/AdGuardHome/internal/next/jsonpatch"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 )
-
-// HTTP Settings Handlers
 
 // ReqPatchSettingsHTTP describes the request to the PATCH /api/v1/settings/http
 // HTTP API.
@@ -22,9 +21,12 @@ type ReqPatchSettingsHTTP struct {
 	//
 	// TODO(a.garipov): Add wait time.
 
-	Addresses       []netip.AddrPort     `json:"addresses"`
-	SecureAddresses []netip.AddrPort     `json:"secure_addresses"`
-	Timeout         aghhttp.JSONDuration `json:"timeout"`
+	Addresses       jsonpatch.NonRemovable[[]netip.AddrPort] `json:"addresses"`
+	SecureAddresses jsonpatch.NonRemovable[[]netip.AddrPort] `json:"secure_addresses"`
+
+	Timeout jsonpatch.NonRemovable[aghhttp.JSONDuration] `json:"timeout"`
+
+	ForceHTTPS jsonpatch.NonRemovable[bool] `json:"force_https"`
 }
 
 // HTTPAPIHTTPSettings are the HTTP settings as used by the HTTP API.  See the
@@ -43,8 +45,6 @@ type HTTPAPIHTTPSettings struct {
 func (svc *Service) handlePatchSettingsHTTP(w http.ResponseWriter, r *http.Request) {
 	req := &ReqPatchSettingsHTTP{}
 
-	// TODO(a.garipov): Validate nulls and proper JSON patch.
-
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		aghhttp.WriteJSONResponseError(w, r, fmt.Errorf("decoding: %w", err))
@@ -52,19 +52,14 @@ func (svc *Service) handlePatchSettingsHTTP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	newConf := &Config{
-		Pprof: &PprofConfig{
-			Port:    svc.pprofPort,
-			Enabled: svc.pprof != nil,
-		},
-		ConfigManager:   svc.confMgr,
-		Frontend:        svc.frontend,
-		TLS:             svc.tls,
-		Addresses:       req.Addresses,
-		SecureAddresses: req.SecureAddresses,
-		Timeout:         time.Duration(req.Timeout),
-		ForceHTTPS:      svc.forceHTTPS,
-	}
+	newConf := svc.Config()
+
+	// TODO(a.garipov): Add more as we go.
+
+	req.Addresses.Set(&newConf.Addresses)
+	req.SecureAddresses.Set(&newConf.SecureAddresses)
+	req.Timeout.Set((*aghhttp.JSONDuration)(&newConf.Timeout))
+	req.ForceHTTPS.Set(&newConf.ForceHTTPS)
 
 	aghhttp.WriteJSONResponseOK(w, r, &HTTPAPIHTTPSettings{
 		Addresses:       newConf.Addresses,
@@ -89,13 +84,13 @@ func (svc *Service) handlePatchSettingsHTTP(w http.ResponseWriter, r *http.Reque
 // relaunch updates the web service in the configuration manager and starts it.
 // It is intended to be used as a goroutine.
 func (svc *Service) relaunch(ctx context.Context, cancel context.CancelFunc, newConf *Config) {
-	defer log.OnPanic("websvc: relaunching")
+	defer slogutil.RecoverAndLog(ctx, svc.logger)
 
 	defer cancel()
 
 	err := svc.confMgr.UpdateWeb(ctx, newConf)
 	if err != nil {
-		log.Error("websvc: updating web: %s", err)
+		svc.logger.ErrorContext(ctx, "updating web", slogutil.KeyError, err)
 
 		return
 	}
@@ -106,18 +101,18 @@ func (svc *Service) relaunch(ctx context.Context, cancel context.CancelFunc, new
 	var newSvc agh.ServiceWithConfig[*Config]
 	for newSvc = svc.confMgr.Web(); newSvc == svc; {
 		if time.Since(updStart) >= maxUpdDur {
-			log.Error("websvc: failed to update svc after %s", maxUpdDur)
+			svc.logger.ErrorContext(ctx, "failed to update service on time", "duration", maxUpdDur)
 
 			return
 		}
 
-		log.Debug("websvc: waiting for new websvc to be configured")
+		svc.logger.DebugContext(ctx, "waiting for new service")
 
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	err = newSvc.Start()
+	err = newSvc.Start(ctx)
 	if err != nil {
-		log.Error("websvc: new svc failed to start with error: %s", err)
+		svc.logger.ErrorContext(ctx, "new service failed", slogutil.KeyError, err)
 	}
 }

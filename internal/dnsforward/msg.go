@@ -2,26 +2,30 @@ package dnsforward
 
 import (
 	"net/netip"
+	"slices"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/urlfilter/rules"
 	"github.com/miekg/dns"
-	"golang.org/x/exp/slices"
 )
 
-// makeResponse creates a DNS response by req and sets necessary flags.  It also
-// guarantees that req.Question will be not empty.
-func (s *Server) makeResponse(req *dns.Msg) (resp *dns.Msg) {
-	resp = &dns.Msg{
-		MsgHdr: dns.MsgHdr{
-			RecursionAvailable: true,
-		},
-		Compress: true,
-	}
+// TODO(e.burkov):  Name all the methods by a [proxy.MessageConstructor]
+// template.  Also extract all the methods to a separate entity.
 
-	resp.SetReply(req)
+// reply creates a DNS response for req.
+func (*Server) reply(req *dns.Msg, code int) (resp *dns.Msg) {
+	resp = (&dns.Msg{}).SetRcode(req, code)
+	resp.RecursionAvailable = true
+
+	return resp
+}
+
+// replyCompressed creates a DNS response for req and sets the compress flag.
+func (s *Server) replyCompressed(req *dns.Msg) (resp *dns.Msg) {
+	resp = s.reply(req, dns.RcodeSuccess)
+	resp.Compress = true
 
 	return resp
 }
@@ -48,13 +52,13 @@ func (s *Server) genDNSFilterMessage(
 ) (resp *dns.Msg) {
 	req := dctx.Req
 	qt := req.Question[0].Qtype
-	if qt != dns.TypeA && qt != dns.TypeAAAA {
+	if qt != dns.TypeA && qt != dns.TypeAAAA && qt != dns.TypeHTTPS {
 		m, _, _ := s.dnsFilter.BlockingMode()
 		if m == filtering.BlockingModeNullIP {
-			return s.makeResponse(req)
+			return s.replyCompressed(req)
 		}
 
-		return s.newMsgNODATA(req)
+		return s.NewMsgNODATA(req)
 	}
 
 	switch res.Reason {
@@ -75,7 +79,7 @@ func (s *Server) genDNSFilterMessage(
 // getCNAMEWithIPs generates a filtered response to req for with CNAME record
 // and provided ips.
 func (s *Server) getCNAMEWithIPs(req *dns.Msg, ips []netip.Addr, cname string) (resp *dns.Msg) {
-	resp = s.makeResponse(req)
+	resp = s.replyCompressed(req)
 
 	originalName := req.Question[0].Name
 
@@ -121,13 +125,13 @@ func (s *Server) genForBlockingMode(req *dns.Msg, ips []netip.Addr) (resp *dns.M
 	case filtering.BlockingModeNullIP:
 		return s.makeResponseNullIP(req)
 	case filtering.BlockingModeNXDOMAIN:
-		return s.genNXDomain(req)
+		return s.NewMsgNXDOMAIN(req)
 	case filtering.BlockingModeREFUSED:
 		return s.makeResponseREFUSED(req)
 	default:
 		log.Error("dnsforward: invalid blocking mode %q", mode)
 
-		return s.makeResponse(req)
+		return s.replyCompressed(req)
 	}
 }
 
@@ -148,25 +152,18 @@ func (s *Server) makeResponseCustomIP(
 		// genDNSFilterMessage.
 		log.Error("dnsforward: invalid msg type %s for custom IP blocking mode", dns.Type(qt))
 
-		return s.makeResponse(req)
+		return s.replyCompressed(req)
 	}
 }
 
-func (s *Server) genServerFailure(request *dns.Msg) *dns.Msg {
-	resp := dns.Msg{}
-	resp.SetRcode(request, dns.RcodeServerFailure)
-	resp.RecursionAvailable = true
-	return &resp
-}
-
 func (s *Server) genARecord(request *dns.Msg, ip netip.Addr) *dns.Msg {
-	resp := s.makeResponse(request)
+	resp := s.replyCompressed(request)
 	resp.Answer = append(resp.Answer, s.genAnswerA(request, ip))
 	return resp
 }
 
 func (s *Server) genAAAARecord(request *dns.Msg, ip netip.Addr) *dns.Msg {
-	resp := s.makeResponse(request)
+	resp := s.replyCompressed(request)
 	resp.Answer = append(resp.Answer, s.genAnswerAAAA(request, ip))
 	return resp
 }
@@ -252,7 +249,7 @@ func (s *Server) genResponseWithIPs(req *dns.Msg, ips []netip.Addr) (resp *dns.M
 		// Go on and return an empty response.
 	}
 
-	resp = s.makeResponse(req)
+	resp = s.replyCompressed(req)
 	resp.Answer = ans
 
 	return resp
@@ -288,7 +285,7 @@ func (s *Server) makeResponseNullIP(req *dns.Msg) (resp *dns.Msg) {
 	case dns.TypeAAAA:
 		resp = s.genResponseWithIPs(req, []netip.Addr{netip.IPv6Unspecified()})
 	default:
-		resp = s.makeResponse(req)
+		resp = s.replyCompressed(req)
 	}
 
 	return resp
@@ -298,7 +295,7 @@ func (s *Server) genBlockedHost(request *dns.Msg, newAddr string, d *proxy.DNSCo
 	if newAddr == "" {
 		log.Info("dnsforward: block host is not specified")
 
-		return s.genServerFailure(request)
+		return s.NewMsgSERVFAIL(request)
 	}
 
 	ip, err := netip.ParseAddr(newAddr)
@@ -321,17 +318,17 @@ func (s *Server) genBlockedHost(request *dns.Msg, newAddr string, d *proxy.DNSCo
 	if prx == nil {
 		log.Debug("dnsforward: %s", srvClosedErr)
 
-		return s.genServerFailure(request)
+		return s.NewMsgSERVFAIL(request)
 	}
 
 	err = prx.Resolve(newContext)
 	if err != nil {
 		log.Info("dnsforward: looking up replacement host %q: %s", newAddr, err)
 
-		return s.genServerFailure(request)
+		return s.NewMsgSERVFAIL(request)
 	}
 
-	resp := s.makeResponse(request)
+	resp := s.replyCompressed(request)
 	if newContext.Res != nil {
 		for _, answer := range newContext.Res.Answer {
 			answer.Header().Name = request.Question[0].Name
@@ -342,56 +339,69 @@ func (s *Server) genBlockedHost(request *dns.Msg, newAddr string, d *proxy.DNSCo
 	return resp
 }
 
-// preBlockedResponse returns a protocol-appropriate response for a request that
-// was blocked by access settings.
-func (s *Server) preBlockedResponse(pctx *proxy.DNSContext) (reply bool, err error) {
-	if pctx.Proto == proxy.ProtoUDP || pctx.Proto == proxy.ProtoDNSCrypt {
-		// Return nil so that dnsproxy drops the connection and thus
-		// prevent DNS amplification attacks.
-		return false, nil
-	}
-
-	pctx.Res = s.makeResponseREFUSED(pctx.Req)
-
-	return true, nil
-}
-
 // Create REFUSED DNS response
-func (s *Server) makeResponseREFUSED(request *dns.Msg) *dns.Msg {
-	resp := dns.Msg{}
-	resp.SetRcode(request, dns.RcodeRefused)
-	resp.RecursionAvailable = true
-	return &resp
+func (s *Server) makeResponseREFUSED(req *dns.Msg) *dns.Msg {
+	return s.reply(req, dns.RcodeRefused)
 }
 
-// newMsgNODATA returns a properly initialized NODATA response.
-//
-// See https://www.rfc-editor.org/rfc/rfc2308#section-2.2.
-func (s *Server) newMsgNODATA(req *dns.Msg) (resp *dns.Msg) {
-	resp = (&dns.Msg{}).SetRcode(req, dns.RcodeSuccess)
-	resp.RecursionAvailable = true
+// type check
+var _ proxy.MessageConstructor = (*Server)(nil)
+
+// NewMsgNXDOMAIN implements the [proxy.MessageConstructor] interface for
+// *Server.
+func (s *Server) NewMsgNXDOMAIN(req *dns.Msg) (resp *dns.Msg) {
+	resp = s.reply(req, dns.RcodeNameError)
 	resp.Ns = s.genSOA(req)
 
 	return resp
 }
 
-func (s *Server) genNXDomain(request *dns.Msg) *dns.Msg {
-	resp := dns.Msg{}
-	resp.SetRcode(request, dns.RcodeNameError)
-	resp.RecursionAvailable = true
-	resp.Ns = s.genSOA(request)
-	return &resp
+// NewMsgSERVFAIL implements the [proxy.MessageConstructor] interface for
+// *Server.
+func (s *Server) NewMsgSERVFAIL(req *dns.Msg) (resp *dns.Msg) {
+	return s.reply(req, dns.RcodeServerFailure)
 }
 
-func (s *Server) genSOA(request *dns.Msg) []dns.RR {
+// NewMsgNOTIMPLEMENTED implements the [proxy.MessageConstructor] interface for
+// *Server.
+func (s *Server) NewMsgNOTIMPLEMENTED(req *dns.Msg) (resp *dns.Msg) {
+	resp = s.reply(req, dns.RcodeNotImplemented)
+
+	// Most of the Internet and especially the inner core has an MTU of at least
+	// 1500 octets.  Maximum DNS/UDP payload size for IPv6 on MTU 1500 ethernet
+	// is 1452 (1500 minus 40 (IPv6 header size) minus 8 (UDP header size)).
+	//
+	// See appendix A of https://datatracker.ietf.org/doc/draft-ietf-dnsop-avoid-fragmentation/17.
+	const maxUDPPayload = 1452
+
+	// NOTIMPLEMENTED without EDNS is treated as 'we don't support EDNS', so
+	// explicitly set it.
+	resp.SetEdns0(maxUDPPayload, false)
+
+	return resp
+}
+
+// NewMsgNODATA implements the [proxy.MessageConstructor] interface for *Server.
+func (s *Server) NewMsgNODATA(req *dns.Msg) (resp *dns.Msg) {
+	resp = s.reply(req, dns.RcodeSuccess)
+	resp.Ns = s.genSOA(req)
+
+	return resp
+}
+
+func (s *Server) genSOA(req *dns.Msg) []dns.RR {
 	zone := ""
-	if len(request.Question) > 0 {
-		zone = request.Question[0].Name
+	if len(req.Question) > 0 {
+		zone = req.Question[0].Name
 	}
 
+	const defaultBlockedResponseTTL = 3600
+
 	soa := dns.SOA{
-		// values copied from verisign's nonexistent .com domain
-		// their exact values are not important in our use case because they are used for domain transfers between primary/secondary DNS servers
+		// Values copied from verisign's nonexistent.com domain.
+		//
+		// Their exact values are not important in our use case because they are
+		// used for domain transfers between primary/secondary DNS servers.
 		Refresh: 1800,
 		Retry:   900,
 		Expire:  604800,
@@ -406,13 +416,16 @@ func (s *Server) genSOA(request *dns.Msg) []dns.RR {
 			Ttl:    s.dnsFilter.BlockedResponseTTL(),
 			Class:  dns.ClassINET,
 		},
-		Mbox: "hostmaster.", // zone will be appended later if it's not empty or "."
+		// zone will be appended later if it's not ".".
+		Mbox: "hostmaster.",
 	}
 	if soa.Hdr.Ttl == 0 {
 		soa.Hdr.Ttl = defaultBlockedResponseTTL
 	}
-	if len(zone) > 0 && zone[0] != '.' {
+
+	if zone != "." {
 		soa.Mbox += zone
 	}
+
 	return []dns.RR{&soa}
 }

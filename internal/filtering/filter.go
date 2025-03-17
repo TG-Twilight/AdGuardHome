@@ -4,28 +4,25 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghrenameio"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering/rulelist"
+	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
-	"github.com/AdguardTeam/golibs/stringutil"
-	"golang.org/x/exp/slices"
 )
 
 // filterDir is the subdirectory of a data directory to store downloaded
 // filters.
 const filterDir = "filters"
-
-// nextFilterID is a way to seed a unique ID generation.
-//
-// TODO(e.burkov):  Use more deterministic approach.
-var nextFilterID = time.Now().Unix()
 
 // FilterYAML represents a filter list in the configuration file.
 //
@@ -50,7 +47,10 @@ func (filter *FilterYAML) unload() {
 
 // Path to the filter contents
 func (filter *FilterYAML) Path(dataDir string) string {
-	return filepath.Join(dataDir, filterDir, strconv.FormatInt(filter.ID, 10)+".txt")
+	return filepath.Join(
+		dataDir,
+		filterDir,
+		strconv.FormatInt(int64(filter.ID), 10)+".txt")
 }
 
 // ensureName sets provided title or default name for the filter if it doesn't
@@ -217,7 +217,10 @@ func (d *DNSFilter) loadFilters(array []FilterYAML) {
 	for i := range array {
 		filter := &array[i] // otherwise we're operating on a copy
 		if filter.ID == 0 {
-			filter.ID = assignUniqueFilterID()
+			newID := d.idGen.next()
+			log.Info("filtering: warning: filter at index %d has no id; assigning to %d", i, newID)
+
+			filter.ID = newID
 		}
 
 		if !filter.Enabled {
@@ -233,7 +236,7 @@ func (d *DNSFilter) loadFilters(array []FilterYAML) {
 }
 
 func deduplicateFilters(filters []FilterYAML) (deduplicated []FilterYAML) {
-	urls := stringutil.NewSet()
+	urls := container.NewMapSet[string]()
 	lastIdx := 0
 
 	for _, filter := range filters {
@@ -245,22 +248,6 @@ func deduplicateFilters(filters []FilterYAML) (deduplicated []FilterYAML) {
 	}
 
 	return filters[:lastIdx]
-}
-
-// Set the next filter ID to max(filter.ID) + 1
-func updateUniqueFilterID(filters []FilterYAML) {
-	for _, filter := range filters {
-		if nextFilterID < filter.ID {
-			nextFilterID = filter.ID + 1
-		}
-	}
-}
-
-// TODO(e.burkov):  Improve this inexhaustible source of races.
-func assignUniqueFilterID() int64 {
-	value := nextFilterID
-	nextFilterID++
-	return value
 }
 
 // tryRefreshFilters is like [refreshFilters], but backs down if the update is
@@ -463,11 +450,7 @@ func (d *DNSFilter) updateIntl(flt *FilterYAML) (ok bool, err error) {
 
 	var res *rulelist.ParseResult
 
-	// Change the default 0o600 permission to something more acceptable by end
-	// users.
-	//
-	// See https://github.com/AdguardTeam/AdGuardHome/issues/3198.
-	tmpFile, err := aghrenameio.NewPendingFile(flt.Path(d.conf.DataDir), 0o644)
+	tmpFile, err := aghrenameio.NewPendingFile(flt.Path(d.conf.DataDir), aghos.DefaultPermFile)
 	if err != nil {
 		return false, err
 	}
@@ -535,6 +518,11 @@ func (d *DNSFilter) reader(fltURL string) (r io.ReadCloser, err error) {
 		}
 
 		return r, nil
+	}
+
+	fltURL = filepath.Clean(fltURL)
+	if !pathMatchesAny(d.safeFSPatterns, fltURL) {
+		return nil, fmt.Errorf("path %q does not match safe patterns", fltURL)
 	}
 
 	r, err = os.Open(fltURL)
@@ -608,7 +596,7 @@ func (d *DNSFilter) EnableFilters(async bool) {
 func (d *DNSFilter) enableFiltersLocked(async bool) {
 	filters := make([]Filter, 1, len(d.conf.Filters)+len(d.conf.WhitelistFilters)+1)
 	filters[0] = Filter{
-		ID:   CustomListID,
+		ID:   rulelist.URLFilterIDCustom,
 		Data: []byte(strings.Join(d.conf.UserRules, "\n")),
 	}
 
@@ -641,4 +629,20 @@ func (d *DNSFilter) enableFiltersLocked(async bool) {
 	}
 
 	d.SetEnabled(d.conf.FilteringEnabled)
+}
+
+// ApplyAdditionalFiltering enhances the provided filtering settings with
+// blocked services and client-specific configurations.
+func (d *DNSFilter) ApplyAdditionalFiltering(cliAddr netip.Addr, clientID string, setts *Settings) {
+	d.ApplyBlockedServices(setts)
+
+	d.applyClientFiltering(clientID, cliAddr, setts)
+	if setts.BlockedServices != nil {
+		// TODO(e.burkov):  Get rid of this crutch.
+		setts.ServicesRules = nil
+		svcs := setts.BlockedServices.IDs
+		if !setts.BlockedServices.Schedule.Contains(time.Now()) {
+			d.ApplyBlockedServicesList(setts, svcs)
+		}
+	}
 }

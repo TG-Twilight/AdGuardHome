@@ -7,11 +7,9 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
-	"github.com/AdguardTeam/AdGuardHome/internal/client"
 	"github.com/AdguardTeam/AdGuardHome/internal/next/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/rdns"
 	"github.com/AdguardTeam/AdGuardHome/internal/whois"
-	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/miekg/dns"
 )
@@ -26,13 +24,24 @@ import (
 
 // FSWatcher is a fake [aghos.FSWatcher] implementation for tests.
 type FSWatcher struct {
+	OnStart  func() (err error)
+	OnClose  func() (err error)
 	OnEvents func() (e <-chan struct{})
 	OnAdd    func(name string) (err error)
-	OnClose  func() (err error)
 }
 
 // type check
 var _ aghos.FSWatcher = (*FSWatcher)(nil)
+
+// Start implements the [aghos.FSWatcher] interface for *FSWatcher.
+func (w *FSWatcher) Start() (err error) {
+	return w.OnStart()
+}
+
+// Close implements the [aghos.FSWatcher] interface for *FSWatcher.
+func (w *FSWatcher) Close() (err error) {
+	return w.OnClose()
+}
 
 // Events implements the [aghos.FSWatcher] interface for *FSWatcher.
 func (w *FSWatcher) Events() (e <-chan struct{}) {
@@ -44,16 +53,11 @@ func (w *FSWatcher) Add(name string) (err error) {
 	return w.OnAdd(name)
 }
 
-// Close implements the [aghos.FSWatcher] interface for *FSWatcher.
-func (w *FSWatcher) Close() (err error) {
-	return w.OnClose()
-}
-
 // Package agh
 
 // ServiceWithConfig is a fake [agh.ServiceWithConfig] implementation for tests.
 type ServiceWithConfig[ConfigType any] struct {
-	OnStart    func() (err error)
+	OnStart    func(ctx context.Context) (err error)
 	OnShutdown func(ctx context.Context) (err error)
 	OnConfig   func() (c ConfigType)
 }
@@ -63,8 +67,8 @@ var _ agh.ServiceWithConfig[struct{}] = (*ServiceWithConfig[struct{}])(nil)
 
 // Start implements the [agh.ServiceWithConfig] interface for
 // *ServiceWithConfig.
-func (s *ServiceWithConfig[_]) Start() (err error) {
-	return s.OnStart()
+func (s *ServiceWithConfig[_]) Start(ctx context.Context) (err error) {
+	return s.OnStart(ctx)
 }
 
 // Shutdown implements the [agh.ServiceWithConfig] interface for
@@ -84,17 +88,14 @@ func (s *ServiceWithConfig[ConfigType]) Config() (c ConfigType) {
 // AddressProcessor is a fake [client.AddressProcessor] implementation for
 // tests.
 type AddressProcessor struct {
-	OnProcess func(ip netip.Addr)
+	OnProcess func(ctx context.Context, ip netip.Addr)
 	OnClose   func() (err error)
 }
 
-// type check
-var _ client.AddressProcessor = (*AddressProcessor)(nil)
-
 // Process implements the [client.AddressProcessor] interface for
 // *AddressProcessor.
-func (p *AddressProcessor) Process(ip netip.Addr) {
-	p.OnProcess(ip)
+func (p *AddressProcessor) Process(ctx context.Context, ip netip.Addr) {
+	p.OnProcess(ctx, ip)
 }
 
 // Close implements the [client.AddressProcessor] interface for
@@ -105,36 +106,18 @@ func (p *AddressProcessor) Close() (err error) {
 
 // AddressUpdater is a fake [client.AddressUpdater] implementation for tests.
 type AddressUpdater struct {
-	OnUpdateAddress func(ip netip.Addr, host string, info *whois.Info)
+	OnUpdateAddress func(ctx context.Context, ip netip.Addr, host string, info *whois.Info)
 }
-
-// type check
-var _ client.AddressUpdater = (*AddressUpdater)(nil)
 
 // UpdateAddress implements the [client.AddressUpdater] interface for
 // *AddressUpdater.
-func (p *AddressUpdater) UpdateAddress(ip netip.Addr, host string, info *whois.Info) {
-	p.OnUpdateAddress(ip, host, info)
-}
-
-// Package dnsforward
-
-// ClientsContainer is a fake [dnsforward.ClientsContainer] implementation for
-// tests.
-type ClientsContainer struct {
-	OnUpstreamConfigByID func(
-		id string,
-		boot upstream.Resolver,
-	) (conf *proxy.CustomUpstreamConfig, err error)
-}
-
-// UpstreamConfigByID implements the [dnsforward.ClientsContainer] interface
-// for *ClientsContainer.
-func (c *ClientsContainer) UpstreamConfigByID(
-	id string,
-	boot upstream.Resolver,
-) (conf *proxy.CustomUpstreamConfig, err error) {
-	return c.OnUpstreamConfigByID(id, boot)
+func (p *AddressUpdater) UpdateAddress(
+	ctx context.Context,
+	ip netip.Addr,
+	host string,
+	info *whois.Info,
+) {
+	p.OnUpdateAddress(ctx, ip, host, info)
 }
 
 // Package filtering

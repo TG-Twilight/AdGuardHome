@@ -63,6 +63,7 @@
 }
 
 .form__message {
+    margin-top: 4px;
     font-size: 11px;
 }
 
@@ -80,11 +81,11 @@
 }
 
 .interface__ip:after {
-    content: ", ";
+    content: ', ';
 }
 
 .interface__ip:last-child:after {
-    content: "";
+    content: '';
 }
 
 .form__desc {
@@ -95,6 +96,10 @@
 
 .form__desc--top {
     margin: 0 0 8px;
+}
+
+.form__label {
+    margin-bottom: 8px;
 }
 
 .form__label--bold {
@@ -150,7 +155,9 @@
 
 .custom-control-label,
 .custom-control-label:before {
-    transition: 0.3s ease-in-out background-color, 0.3s ease-in-out color;
+    transition:
+        0.3s ease-in-out background-color,
+        0.3s ease-in-out color;
 }
 
 .custom-select:disabled {
@@ -158,5 +165,7 @@
 }
 
 .custom-select {
-    transition: 0.3s ease-in-out background-color, 0.3s ease-in-out color;
+    transition:
+        0.3s ease-in-out background-color,
+        0.3s ease-in-out color;
 }

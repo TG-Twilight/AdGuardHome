@@ -9,7 +9,7 @@
 # This comment is used to simplify checking local copies of the script.  Bump
 # this number every time a significant change is made to this script.
 #
-# AdGuard-Project-Version: 1
+# AdGuard-Project-Version: 2
 
 # The default verbosity level is 0.  Show every command that is run and every
 # package that is processed if the caller requested verbosity level greater than
@@ -18,14 +18,12 @@
 verbose="${VERBOSE:-0}"
 readonly verbose
 
-if [ "$verbose" -gt '1' ]
-then
+if [ "$verbose" -gt '1' ]; then
 	env
 	set -x
 	v_flags='-v=1'
 	x_flags='-x=1'
-elif [ "$verbose" -gt '0' ]
-then
+elif [ "$verbose" -gt '0' ]; then
 	set -x
 	v_flags='-v=1'
 	x_flags='-x=0'
@@ -49,14 +47,13 @@ readonly go
 channel="${CHANNEL:?please set CHANNEL}"
 readonly channel
 
-case "$channel"
-in
-('development'|'edge'|'beta'|'release')
+case "$channel" in
+'development' | 'edge' | 'beta' | 'release' | 'candidate')
 	# All is well, go on.
 	;;
-(*)
-	echo "invalid channel '$channel', supported values are\
-		'development', 'edge', 'beta', and 'release'" 1>&2
+*)
+	echo "invalid channel '$channel', supported values are \
+		'development', 'edge', 'beta', 'release', and 'candidate'" 1>&2
 	exit 1
 	;;
 esac
@@ -64,14 +61,13 @@ esac
 # Check VERSION against the default value from the Makefile.  If it is that, use
 # the version calculation script.
 version="${VERSION:-}"
-if [ "$version" = 'v0.0.0' ] || [ "$version" = '' ]
-then
-	version="$( sh ./scripts/make/version.sh )"
+if [ "$version" = 'v0.0.0' ] || [ "$version" = '' ]; then
+	version="$(sh ./scripts/make/version.sh)"
 fi
 readonly version
 
 # Set date and time of the latest commit unless already set.
-committime="${SOURCE_DATE_EPOCH:-$( git log -1 --pretty=%ct )}"
+committime="${SOURCE_DATE_EPOCH:-$(git log -1 --pretty=%ct)}"
 readonly committime
 
 # Set the linker flags accordingly: set the release channel and the current
@@ -84,13 +80,12 @@ ldflags="-s -w"
 ldflags="${ldflags} -X ${version_pkg}.version=${version}"
 ldflags="${ldflags} -X ${version_pkg}.channel=${channel}"
 ldflags="${ldflags} -X ${version_pkg}.committime=${committime}"
-if [ "${GOARM:-}" != '' ]
-then
+if [ "${GOARM:-}" != '' ]; then
 	ldflags="${ldflags} -X ${version_pkg}.goarm=${GOARM}"
-elif [ "${GOMIPS:-}" != '' ]
-then
+elif [ "${GOMIPS:-}" != '' ]; then
 	ldflags="${ldflags} -X ${version_pkg}.gomips=${GOMIPS}"
 fi
+readonly ldflags
 
 # Allow users to limit the build's parallelism.
 parallelism="${PARALLELISM:-}"
@@ -98,9 +93,8 @@ readonly parallelism
 
 # Use GOFLAGS for -p, because -p=0 simply disables the build instead of leaving
 # the default value.
-if [ "${parallelism}" != '' ]
-then
-        GOFLAGS="${GOFLAGS:-} -p=${parallelism}"
+if [ "${parallelism}" != '' ]; then
+	GOFLAGS="${GOFLAGS:-} -p=${parallelism}"
 fi
 readonly GOFLAGS
 export GOFLAGS
@@ -114,8 +108,7 @@ readonly o_flags
 
 # Allow users to enable the race detector.  Unfortunately, that means that cgo
 # must be enabled.
-if [ "${RACE:-0}" -eq '0' ]
-then
+if [ "${RACE:-0}" -eq '0' ]; then
 	CGO_ENABLED='0'
 	race_flags='--race=0'
 else
@@ -129,24 +122,30 @@ GO111MODULE='on'
 export GO111MODULE
 
 # Build the new binary if requested.
-if [ "${NEXTAPI:-0}" -eq '0' ]
-then
+if [ "${NEXTAPI:-0}" -eq '0' ]; then
 	tags_flags='--tags='
 else
 	tags_flags='--tags=next'
 fi
 readonly tags_flags
 
-if [ "$verbose" -gt '0' ]
-then
+if [ "$verbose" -gt '0' ]; then
 	"$go" env
 fi
 
-"$go" build\
-	--ldflags "$ldflags"\
-	"$race_flags"\
-	"$tags_flags"\
-	--trimpath\
-	"$o_flags"\
-	"$v_flags"\
-	"$x_flags"
+if [ "${COVER:-0}" -eq '1' ]; then
+	cover_flags='--cover=1'
+else
+	cover_flags='--cover=0'
+fi
+
+"$go" build \
+	"$cover_flags" \
+	--ldflags="$ldflags" \
+	"$race_flags" \
+	"$tags_flags" \
+	--trimpath \
+	"$o_flags" \
+	"$v_flags" \
+	"$x_flags" \
+	;

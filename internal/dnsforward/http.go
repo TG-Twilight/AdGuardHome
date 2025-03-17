@@ -1,21 +1,25 @@
 package dnsforward
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/stringutil"
-	"golang.org/x/exp/slices"
+	"github.com/AdguardTeam/golibs/validate"
 )
 
 // jsonDNSConfig is the JSON representation of the DNS server configuration.
@@ -50,6 +54,9 @@ type jsonDNSConfig struct {
 	// RatelimitSubnetLenIPv6 is a subnet length for IPv6 addresses used for
 	// rate limiting requests.
 	RatelimitSubnetLenIPv6 *int `json:"ratelimit_subnet_len_ipv6"`
+
+	// UpstreamTimeout is an upstream timeout in seconds.
+	UpstreamTimeout *int `json:"upstream_timeout"`
 
 	// RatelimitWhitelist is a list of IP addresses excluded from rate limiting.
 	RatelimitWhitelist *[]netip.Addr `json:"ratelimit_whitelist"`
@@ -145,6 +152,7 @@ func (s *Server) getDNSConfig() (c *jsonDNSConfig) {
 	ratelimitSubnetLenIPv4 := s.conf.RatelimitSubnetLenIPv4
 	ratelimitSubnetLenIPv6 := s.conf.RatelimitSubnetLenIPv6
 	ratelimitWhitelist := append([]netip.Addr{}, s.conf.RatelimitWhitelist...)
+	upstreamTimeout := int(s.conf.UpstreamTimeout.Seconds())
 
 	customIP := s.conf.EDNSClientSubnet.CustomIP
 	enableEDNSClientSubnet := s.conf.EDNSClientSubnet.Enabled
@@ -190,6 +198,7 @@ func (s *Server) getDNSConfig() (c *jsonDNSConfig) {
 		RatelimitSubnetLenIPv4:   &ratelimitSubnetLenIPv4,
 		RatelimitSubnetLenIPv6:   &ratelimitSubnetLenIPv6,
 		RatelimitWhitelist:       &ratelimitWhitelist,
+		UpstreamTimeout:          &upstreamTimeout,
 		EDNSCSCustomIP:           customIP,
 		EDNSCSEnabled:            &enableEDNSClientSubnet,
 		EDNSCSUseCustom:          &useCustom,
@@ -260,55 +269,17 @@ func (req *jsonDNSConfig) checkUpstreamMode() (err error) {
 	}
 }
 
-// checkBootstrap returns an error if any bootstrap address is invalid.
-func (req *jsonDNSConfig) checkBootstrap() (err error) {
-	if req.Bootstraps == nil {
-		return nil
-	}
-
-	var b string
-	defer func() { err = errors.Annotate(err, "checking bootstrap %s: %w", b) }()
-
-	for _, b = range *req.Bootstraps {
-		if b == "" {
-			return errors.Error("empty")
-		}
-
-		var resolver *upstream.UpstreamResolver
-		if resolver, err = upstream.NewUpstreamResolver(b, nil); err != nil {
-			// Don't wrap the error because it's informative enough as is.
-			return err
-		}
-
-		if err = resolver.Close(); err != nil {
-			return fmt.Errorf("closing %s: %w", b, err)
-		}
-	}
-
-	return nil
-}
-
-// checkFallbacks returns an error if any fallback address is invalid.
-func (req *jsonDNSConfig) checkFallbacks() (err error) {
-	if req.Fallbacks == nil {
-		return nil
-	}
-
-	err = ValidateUpstreams(*req.Fallbacks)
-	if err != nil {
-		return fmt.Errorf("fallback servers: %w", err)
-	}
-
-	return nil
-}
-
 // validate returns an error if any field of req is invalid.
 //
 // TODO(s.chzhen):  Parse, don't validate.
-func (req *jsonDNSConfig) validate(privateNets netutil.SubnetSet) (err error) {
+func (req *jsonDNSConfig) validate(
+	ownAddrs addrPortSet,
+	sysResolvers SystemResolvers,
+	privateNets netutil.SubnetSet,
+) (err error) {
 	defer func() { err = errors.Annotate(err, "validating dns config: %w") }()
 
-	err = req.validateUpstreamDNSServers(privateNets)
+	err = req.validateUpstreamDNSServers(ownAddrs, sysResolvers, privateNets)
 	if err != nil {
 		// Don't wrap the error since it's informative enough as is.
 		return err
@@ -338,23 +309,93 @@ func (req *jsonDNSConfig) validate(privateNets netutil.SubnetSet) (err error) {
 		return err
 	}
 
+	err = req.checkUpstreamTimeout()
+	if err != nil {
+		// Don't wrap the error since it's informative enough as is.
+		return err
+	}
+
+	return nil
+}
+
+// checkBootstrap returns an error if any bootstrap address is invalid.
+func (req *jsonDNSConfig) checkBootstrap() (err error) {
+	if req.Bootstraps == nil {
+		return nil
+	}
+
+	var b string
+	defer func() { err = errors.Annotate(err, "checking bootstrap %s: %w", b) }()
+
+	for _, b = range *req.Bootstraps {
+		if b == "" {
+			return errors.Error("empty")
+		}
+
+		var resolver *upstream.UpstreamResolver
+		if resolver, err = upstream.NewUpstreamResolver(b, nil); err != nil {
+			// Don't wrap the error because it's informative enough as is.
+			return err
+		}
+
+		if err = resolver.Close(); err != nil {
+			return fmt.Errorf("closing %s: %w", b, err)
+		}
+	}
+
+	return nil
+}
+
+// containsPrivateRDNS returns true if req contains private RDNS settings and
+// should be validated.
+func (req *jsonDNSConfig) containsPrivateRDNS() (ok bool) {
+	return (req.UsePrivateRDNS != nil && *req.UsePrivateRDNS) ||
+		(req.LocalPTRUpstreams != nil && len(*req.LocalPTRUpstreams) > 0)
+}
+
+// checkPrivateRDNS returns an error if the configuration of the private RDNS is
+// not valid.
+func (req *jsonDNSConfig) checkPrivateRDNS(
+	ownAddrs addrPortSet,
+	sysResolvers SystemResolvers,
+	privateNets netutil.SubnetSet,
+) (err error) {
+	if !req.containsPrivateRDNS() {
+		return nil
+	}
+
+	addrs := cmp.Or(req.LocalPTRUpstreams, &[]string{})
+
+	uc, err := newPrivateConfig(*addrs, ownAddrs, sysResolvers, privateNets, &upstream.Options{})
+	err = errors.WithDeferred(err, uc.Close())
+	if err != nil {
+		return fmt.Errorf("private upstream servers: %w", err)
+	}
+
 	return nil
 }
 
 // validateUpstreamDNSServers returns an error if any field of req is invalid.
-func (req *jsonDNSConfig) validateUpstreamDNSServers(privateNets netutil.SubnetSet) (err error) {
+func (req *jsonDNSConfig) validateUpstreamDNSServers(
+	ownAddrs addrPortSet,
+	sysResolvers SystemResolvers,
+	privateNets netutil.SubnetSet,
+) (err error) {
+	var uc *proxy.UpstreamConfig
+	opts := &upstream.Options{}
+
 	if req.Upstreams != nil {
-		err = ValidateUpstreams(*req.Upstreams)
+		uc, err = proxy.ParseUpstreamsConfig(*req.Upstreams, opts)
+		err = errors.WithDeferred(err, uc.Close())
 		if err != nil {
 			return fmt.Errorf("upstream servers: %w", err)
 		}
 	}
 
-	if req.LocalPTRUpstreams != nil {
-		err = ValidateUpstreamsPrivate(*req.LocalPTRUpstreams, privateNets)
-		if err != nil {
-			return fmt.Errorf("private upstream servers: %w", err)
-		}
+	err = req.checkPrivateRDNS(ownAddrs, sysResolvers, privateNets)
+	if err != nil {
+		// Don't wrap the error since it's informative enough as is.
+		return err
 	}
 
 	err = req.checkBootstrap()
@@ -363,10 +404,12 @@ func (req *jsonDNSConfig) validateUpstreamDNSServers(privateNets netutil.SubnetS
 		return err
 	}
 
-	err = req.checkFallbacks()
-	if err != nil {
-		// Don't wrap the error since it's informative enough as is.
-		return err
+	if req.Fallbacks != nil {
+		uc, err = proxy.ParseUpstreamsConfig(*req.Fallbacks, opts)
+		err = errors.WithDeferred(err, uc.Close())
+		if err != nil {
+			return fmt.Errorf("fallback servers: %w", err)
+		}
 	}
 
 	return nil
@@ -407,6 +450,16 @@ func (req *jsonDNSConfig) checkRatelimitSubnetMaskLen() (err error) {
 	return nil
 }
 
+// checkUpstreamTimeout returns an error if the configuration of the upstream
+// timeout is invalid.
+func (req *jsonDNSConfig) checkUpstreamTimeout() (err error) {
+	if req.UpstreamTimeout == nil {
+		return nil
+	}
+
+	return validate.NoLessThan("upstream_timeout", *req.UpstreamTimeout, 1)
+}
+
 // checkInclusion returns an error if a ptr is not nil and points to value,
 // that not in the inclusive range between minN and maxN.
 func checkInclusion(ptr *int, minN, maxN int) (err error) {
@@ -435,7 +488,16 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = req.validate(s.privateNets)
+	// TODO(e.burkov):  Consider prebuilding this set on startup.
+	ourAddrs, err := s.conf.ourAddrsSet()
+	if err != nil {
+		// TODO(e.burkov):  Put into openapi.
+		aghhttp.Error(r, w, http.StatusInternalServerError, "getting our addresses: %s", err)
+
+		return
+	}
+
+	err = req.validate(ourAddrs, s.sysResolvers, s.privateNets)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
 
@@ -473,8 +535,6 @@ func (s *Server) setConfig(dc *jsonDNSConfig) (shouldRestart bool) {
 
 	if dc.UpstreamMode != nil {
 		s.conf.UpstreamMode = mustParseUpstreamMode(*dc.UpstreamMode)
-	} else {
-		s.conf.UpstreamMode = UpstreamModeLoadBalance
 	}
 
 	if dc.EDNSCSUseCustom != nil && *dc.EDNSCSUseCustom {
@@ -551,6 +611,14 @@ func (s *Server) setConfigRestartable(dc *jsonDNSConfig) (shouldRestart bool) {
 		shouldRestart = true
 	}
 
+	if dc.UpstreamTimeout != nil {
+		ut := time.Duration(*dc.UpstreamTimeout) * time.Second
+		if s.conf.UpstreamTimeout != ut {
+			s.conf.UpstreamTimeout = ut
+			shouldRestart = true
+		}
+	}
+
 	return shouldRestart
 }
 
@@ -580,10 +648,7 @@ func (s *Server) handleTestUpstreamDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.Upstreams = stringutil.FilterOut(req.Upstreams, IsCommentOrEmpty)
-	req.FallbackDNS = stringutil.FilterOut(req.FallbackDNS, IsCommentOrEmpty)
-	req.PrivateUpstreams = stringutil.FilterOut(req.PrivateUpstreams, IsCommentOrEmpty)
-	req.BootstrapDNS = stringutil.FilterOut(req.BootstrapDNS, IsCommentOrEmpty)
+	req.BootstrapDNS = stringutil.FilterOut(req.BootstrapDNS, aghnet.IsCommentOrEmpty)
 
 	opts := &upstream.Options{
 		Timeout:    s.conf.UpstreamTimeout,
@@ -591,7 +656,7 @@ func (s *Server) handleTestUpstreamDNS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var boots []*upstream.UpstreamResolver
-	opts.Bootstrap, boots, err = s.createBootstrap(req.BootstrapDNS, opts)
+	opts.Bootstrap, boots, err = newBootstrap(req.BootstrapDNS, s.etcHosts, opts)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "Failed to parse bootstrap servers: %s", err)
 
@@ -609,6 +674,8 @@ func (s *Server) handleTestUpstreamDNS(w http.ResponseWriter, r *http.Request) {
 // handleCacheClear is the handler for the POST /control/cache_clear HTTP API.
 func (s *Server) handleCacheClear(w http.ResponseWriter, _ *http.Request) {
 	s.dnsProxy.ClearCache()
+	s.conf.ClientsContainer.ClearUpstreamCache()
+
 	_, _ = io.WriteString(w, "OK")
 }
 

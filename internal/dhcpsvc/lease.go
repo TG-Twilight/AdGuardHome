@@ -1,12 +1,10 @@
 package dhcpsvc
 
 import (
-	"bytes"
 	"net"
 	"net/netip"
+	"slices"
 	"time"
-
-	"golang.org/x/exp/slices"
 )
 
 // Lease is a DHCP lease.
@@ -45,9 +43,4 @@ func (l *Lease) Clone() (clone *Lease) {
 		IP:       l.IP,
 		IsStatic: l.IsStatic,
 	}
-}
-
-// compareLeaseMAC compares two [Lease]s by hardware address.
-func compareLeaseMAC(a, b *Lease) (res int) {
-	return bytes.Compare(a.HWAddr, b.HWAddr)
 }

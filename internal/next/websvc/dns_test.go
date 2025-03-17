@@ -15,6 +15,7 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/next/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/next/dnssvc"
 	"github.com/AdguardTeam/AdGuardHome/internal/next/websvc"
+	"github.com/AdguardTeam/golibs/netutil/urlutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -34,13 +35,13 @@ func TestService_HandlePatchSettingsDNS(t *testing.T) {
 	confMgr := newConfigManager()
 	confMgr.onDNS = func() (s agh.ServiceWithConfig[*dnssvc.Config]) {
 		return &aghtest.ServiceWithConfig[*dnssvc.Config]{
-			OnStart: func() (err error) {
+			OnStart: func(_ context.Context) (err error) {
 				started.Store(true)
 
 				return nil
 			},
 			OnShutdown: func(_ context.Context) (err error) { panic("not implemented") },
-			OnConfig:   func() (c *dnssvc.Config) { panic("not implemented") },
+			OnConfig:   func() (c *dnssvc.Config) { return &dnssvc.Config{} },
 		}
 	}
 	confMgr.onUpdateDNS = func(ctx context.Context, c *dnssvc.Config) (err error) {
@@ -49,9 +50,9 @@ func TestService_HandlePatchSettingsDNS(t *testing.T) {
 
 	_, addr := newTestServer(t, confMgr)
 	u := &url.URL{
-		Scheme: "http",
+		Scheme: urlutil.SchemeHTTP,
 		Host:   addr.String(),
-		Path:   websvc.PathV1SettingsDNS,
+		Path:   websvc.PathPatternV1SettingsDNS,
 	}
 
 	req := jobj{

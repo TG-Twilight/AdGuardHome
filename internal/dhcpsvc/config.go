@@ -2,11 +2,14 @@ package dhcpsvc
 
 import (
 	"fmt"
+	"log/slog"
+	"maps"
+	"os"
+	"slices"
 	"time"
 
+	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/netutil"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
 )
 
 // Config is the configuration for the DHCP service.
@@ -15,11 +18,15 @@ type Config struct {
 	// interface identified by its name.
 	Interfaces map[string]*InterfaceConfig
 
+	// Logger will be used to log the DHCP events.
+	Logger *slog.Logger
+
 	// LocalDomainName is the top-level domain name to use for resolving DHCP
 	// clients' hostnames.
 	LocalDomainName string
 
-	// TODO(e.burkov):  Add DB path.
+	// DBFilePath is the path to the database file containing the DHCP leases.
+	DBFilePath string
 
 	// ICMPTimeout is the timeout for checking another DHCP server's presence.
 	ICMPTimeout time.Duration
@@ -38,36 +45,49 @@ type InterfaceConfig struct {
 }
 
 // Validate returns an error in conf if any.
+//
+// TODO(e.burkov):  Unexport and rewrite the test.
 func (conf *Config) Validate() (err error) {
 	switch {
 	case conf == nil:
 		return errNilConfig
 	case !conf.Enabled:
 		return nil
-	case conf.ICMPTimeout < 0:
-		return newMustErr("icmp timeout", "be non-negative", conf.ICMPTimeout)
+	}
+
+	var errs []error
+	if conf.ICMPTimeout < 0 {
+		err = newMustErr("icmp timeout", "be non-negative", conf.ICMPTimeout)
+		errs = append(errs, err)
 	}
 
 	err = netutil.ValidateDomainName(conf.LocalDomainName)
 	if err != nil {
 		// Don't wrap the error since it's informative enough as is.
-		return err
+		errs = append(errs, err)
+	}
+
+	// This is a best-effort check for the file accessibility.  The file will be
+	// checked again when it is opened later.
+	if _, err = os.Stat(conf.DBFilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, fmt.Errorf("db file path %q: %w", conf.DBFilePath, err))
 	}
 
 	if len(conf.Interfaces) == 0 {
-		return errNoInterfaces
+		errs = append(errs, errNoInterfaces)
+
+		return errors.Join(errs...)
 	}
 
-	ifaces := maps.Keys(conf.Interfaces)
-	slices.Sort(ifaces)
-
-	for _, iface := range ifaces {
-		if err = conf.Interfaces[iface].validate(); err != nil {
-			return fmt.Errorf("interface %q: %w", iface, err)
+	for _, iface := range slices.Sorted(maps.Keys(conf.Interfaces)) {
+		ic := conf.Interfaces[iface]
+		err = ic.validate()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("interface %q: %w", iface, err))
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // validate returns an error in ic, if any.

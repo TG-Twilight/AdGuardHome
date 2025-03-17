@@ -7,6 +7,8 @@ package client
 import (
 	"encoding"
 	"fmt"
+	"net/netip"
+	"slices"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/whois"
 )
@@ -56,6 +58,9 @@ func (cs Source) MarshalText() (text []byte, err error) {
 
 // Runtime is a client information from different sources.
 type Runtime struct {
+	// ip is an IP address of a client.
+	ip netip.Addr
+
 	// whois is the filtered WHOIS information of a client.
 	whois *whois.Info
 
@@ -78,6 +83,15 @@ type Runtime struct {
 	// there is no information from the source.  Empty non-nil slice indicates
 	// that the data from the source is present, but empty.
 	hostsFile []string
+}
+
+// NewRuntime constructs a new runtime client.  ip must be valid IP address.
+//
+// TODO(s.chzhen):  Validate IP address.
+func NewRuntime(ip netip.Addr) (r *Runtime) {
+	return &Runtime{
+		ip: ip,
+	}
 }
 
 // Info returns a client information from the highest-priority source.
@@ -105,8 +119,9 @@ func (r *Runtime) Info() (cs Source, host string) {
 	return cs, info[0]
 }
 
-// SetInfo sets a host as a client information from the cs.
-func (r *Runtime) SetInfo(cs Source, hosts []string) {
+// setInfo sets a host as a client information from the cs.
+func (r *Runtime) setInfo(cs Source, hosts []string) {
+	// TODO(s.chzhen):  Use contract where hosts must contain non-empty host.
 	if len(hosts) == 1 && hosts[0] == "" {
 		hosts = []string{}
 	}
@@ -123,18 +138,18 @@ func (r *Runtime) SetInfo(cs Source, hosts []string) {
 	}
 }
 
-// WHOIS returns a WHOIS client information.
+// WHOIS returns a copy of WHOIS client information.
 func (r *Runtime) WHOIS() (info *whois.Info) {
-	return r.whois
+	return r.whois.Clone()
 }
 
-// SetWHOIS sets a WHOIS client information.  info must be non-nil.
-func (r *Runtime) SetWHOIS(info *whois.Info) {
+// setWHOIS sets a WHOIS client information.  info must be non-nil.
+func (r *Runtime) setWHOIS(info *whois.Info) {
 	r.whois = info
 }
 
-// Unset clears a cs information.
-func (r *Runtime) Unset(cs Source) {
+// unset clears a cs information.
+func (r *Runtime) unset(cs Source) {
 	switch cs {
 	case SourceWHOIS:
 		r.whois = nil
@@ -149,11 +164,32 @@ func (r *Runtime) Unset(cs Source) {
 	}
 }
 
-// IsEmpty returns true if there is no information from any source.
-func (r *Runtime) IsEmpty() (ok bool) {
+// isEmpty returns true if there is no information from any source.
+func (r *Runtime) isEmpty() (ok bool) {
 	return r.whois == nil &&
 		r.arp == nil &&
 		r.rdns == nil &&
 		r.dhcp == nil &&
 		r.hostsFile == nil
+}
+
+// Addr returns an IP address of the client.
+func (r *Runtime) Addr() (ip netip.Addr) {
+	return r.ip
+}
+
+// clone returns a deep copy of the runtime client.  If r is nil, c is nil.
+func (r *Runtime) clone() (c *Runtime) {
+	if r == nil {
+		return nil
+	}
+
+	return &Runtime{
+		ip:        r.ip,
+		whois:     r.whois.Clone(),
+		arp:       slices.Clone(r.arp),
+		rdns:      slices.Clone(r.rdns),
+		dhcp:      slices.Clone(r.dhcp),
+		hostsFile: slices.Clone(r.hostsFile),
+	}
 }

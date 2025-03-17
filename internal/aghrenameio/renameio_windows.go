@@ -62,7 +62,9 @@ func newPendingFile(filePath string, mode fs.FileMode) (f PendingFile, err error
 		return nil, fmt.Errorf("opening pending file: %w", err)
 	}
 
-	err = file.Chmod(mode)
+	// TODO(e.burkov):  The [os.Chmod] implementation is useless on Windows,
+	// investigate if it can be removed.
+	err = os.Chmod(file.Name(), mode)
 	if err != nil {
 		return nil, fmt.Errorf("preparing pending file: %w", err)
 	}

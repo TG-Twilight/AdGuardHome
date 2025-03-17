@@ -13,6 +13,8 @@ import (
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/stats"
+	"github.com/AdguardTeam/dnsproxy/proxy"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/AdguardTeam/golibs/timeutil"
@@ -20,10 +22,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestMain(m *testing.M) {
-	testutil.DiscardLogOutput(m)
-}
 
 // constUnitID is the UnitIDGenFunc which always return 0.
 func constUnitID() (id uint32) { return 0 }
@@ -55,6 +53,7 @@ func TestStats(t *testing.T) {
 
 	handlers := map[string]http.Handler{}
 	conf := stats.Config{
+		Logger:            slogutil.NewDiscardLogger(),
 		ShouldCountClient: func([]string) bool { return true },
 		Filename:          filepath.Join(t.TempDir(), "stats.db"),
 		Limit:             timeutil.Day,
@@ -80,15 +79,19 @@ func TestStats(t *testing.T) {
 			Client:         cliIPStr,
 			Result:         stats.RFiltered,
 			ProcessingTime: time.Microsecond * 123456,
-			Upstream:       respUpstream,
-			UpstreamTime:   time.Microsecond * 222222,
+			UpstreamStats: []*proxy.UpstreamStatistics{{
+				Address:       respUpstream,
+				QueryDuration: time.Microsecond * 222222,
+			}},
 		}, {
 			Domain:         reqDomain,
 			Client:         cliIPStr,
 			Result:         stats.RNotFiltered,
 			ProcessingTime: time.Microsecond * 123456,
-			Upstream:       respUpstream,
-			UpstreamTime:   time.Microsecond * 222222,
+			UpstreamStats: []*proxy.UpstreamStatistics{{
+				Address:       respUpstream,
+				QueryDuration: time.Microsecond * 222222,
+			}},
 		}}
 
 		wantData := &stats.StatsResp{
@@ -171,6 +174,7 @@ func TestLargeNumbers(t *testing.T) {
 	handlers := map[string]http.Handler{}
 
 	conf := stats.Config{
+		Logger:            slogutil.NewDiscardLogger(),
 		ShouldCountClient: func([]string) bool { return true },
 		Filename:          filepath.Join(t.TempDir(), "stats.db"),
 		Limit:             timeutil.Day,
@@ -195,7 +199,7 @@ func TestLargeNumbers(t *testing.T) {
 	for h := 0; h < hoursNum; h++ {
 		atomic.AddUint32(&curHour, 1)
 
-		for i := 0; i < cliNumPerHour; i++ {
+		for i := range cliNumPerHour {
 			ip := net.IP{127, 0, byte((i & 0xff00) >> 8), byte(i & 0xff)}
 			e := &stats.Entry{
 				Domain:         fmt.Sprintf("domain%d.hour%d", i, h),
@@ -222,6 +226,7 @@ func TestShouldCount(t *testing.T) {
 	require.NoError(t, err)
 
 	s, err := stats.New(stats.Config{
+		Logger:   slogutil.NewDiscardLogger(),
 		Enabled:  true,
 		Filename: filepath.Join(t.TempDir(), "stats.db"),
 		Limit:    timeutil.Day,

@@ -5,14 +5,23 @@
     'key': 'AHBRTSPECS'
     'name': 'AdGuard Home - Build and run tests'
 'variables':
-    'dockerGo': 'adguard/golang-ubuntu:7.6'
+    'dockerFrontend': 'adguard/home-js-builder:2.1-bullseye'
+    'dockerGo': 'adguard/go-builder:1.24.1--1'
+    'channel': 'development'
 
 'stages':
   - 'Tests':
         'manual': false
         'final': false
         'jobs':
-          - 'Test'
+          - 'Test frontend'
+          - 'Test backend'
+
+  - 'Frontend':
+        manual: false
+        final: false
+        jobs:
+          - 'Build frontend'
 
   - 'Artifact':
         manual: false
@@ -20,14 +29,18 @@
         jobs:
           - 'Artifact'
 
-'Test':
+  - 'E2E':
+      manual: false
+      final: false
+      jobs:
+        - 'Test e2e'
+
+'Test frontend':
     'docker':
-        'image': '${bamboo.dockerGo}'
+        'image': '${bamboo.dockerFrontend}'
         'volumes':
             '${system.YARN_DIR}': '${bamboo.cacheYarn}'
-            '${system.GO_CACHE_DIR}': '${bamboo.cacheGo}'
-            '${system.GO_PKG_CACHE_DIR}': '${bamboo.cacheGoPkg}'
-    'key': 'TEST'
+    'key': 'JSTEST'
     'other':
         'clean-working-dir': true
     'tasks':
@@ -41,13 +54,92 @@
 
                 set -e -f -u -x
 
-                make VERBOSE=1 ci go-tools lint
+                make VERBOSE=1 js-deps js-typecheck js-lint js-test
     'final-tasks':
       - 'clean'
     'requirements':
       - 'adg-docker': 'true'
 
+# TODO(e.burkov):  Add the linting stage for markdown docs and shell scripts.
+'Test backend':
+    'docker':
+        'image': '${bamboo.dockerGo}'
+        'volumes':
+            '${system.GO_CACHE_DIR}': '${bamboo.cacheGo}'
+            '${system.GO_PKG_CACHE_DIR}': '${bamboo.cacheGoPkg}'
+    'key': 'GOTEST'
+    'other':
+        'clean-working-dir': true
+    'tasks':
+      - 'checkout':
+            'force-clean-build': true
+      - 'script':
+            'interpreter': 'SHELL'
+            'scripts':
+              - |
+                #!/bin/sh
+
+                set -e -f -u -x
+
+                make\
+                    GOMAXPROCS=1\
+                    VERBOSE=1\
+                    go-deps go-tools go-lint
+
+                make\
+                    VERBOSE=1\
+                    go-test
+    'final-tasks':
+      - 'clean'
+    'requirements':
+      - 'adg-docker': 'true'
+
+'Build frontend':
+    'artifacts':
+      - 'name': 'AdGuardHome frontend'
+        'pattern': 'build/**'
+        'shared': true
+        'required': true
+    'docker':
+        'image': '${bamboo.dockerFrontend}'
+        'volumes':
+            '${system.YARN_DIR}': '${bamboo.cacheYarn}'
+    'key': 'BF'
+    'other':
+         'clean-working-dir': true
+    'tasks':
+      - 'checkout':
+            'force-clean-build': true
+      - 'script':
+            'interpreter': 'SHELL'
+            'scripts':
+              - |-
+                #!/bin/sh
+
+                set -e -f -u -x
+
+                make\
+                        VERBOSE=1\
+                        js-deps js-build
+    'requirements':
+      - 'adg-docker': 'true'
+
 'Artifact':
+    'artifact-subscriptions':
+      - 'artifact': 'AdGuardHome frontend'
+    'artifacts':
+      - 'name': 'AdGuardHome_windows_amd64'
+        'pattern': 'dist/AdGuardHome_windows_amd64.zip'
+        'shared': true
+        'required': true
+      - 'name': 'AdGuardHome_darwin_amd64'
+        'pattern': 'dist/AdGuardHome_darwin_amd64.zip'
+        'shared': true
+        'required': true
+      - 'name': 'AdGuardHome_linux_amd64'
+        'pattern': 'dist/AdGuardHome_linux_amd64.tar.gz'
+        'shared': true
+        'required': true
     'docker':
         'image': '${bamboo.dockerGo}'
         'volumes':
@@ -67,30 +159,47 @@
 
                 set -e -f -u -x
 
-                # Explicitly checkout the revision that we need.
-                git checkout "${bamboo.repository.revision.number}"
-
                 make\
                         ARCH="amd64"\
+                        CHANNEL=${bamboo.channel}\
+                        FRONTEND_PREBUILT=1\
                         OS="windows darwin linux"\
-                        CHANNEL="development"\
-                        SIGN=0\
                         PARALLELISM=1\
+                        SIGN=0\
                         VERBOSE=2\
                         build-release
-    'artifacts':
-      - 'name': 'AdGuardHome_windows_amd64'
-        'pattern': 'dist/AdGuardHome_windows_amd64.zip'
-        'shared': true
-        'required': true
-      - 'name': 'AdGuardHome_darwin_amd64'
-        'pattern': 'dist/AdGuardHome_darwin_amd64.zip'
-        'shared': true
-        'required': true
-      - 'name': 'AdGuardHome_linux_amd64'
-        'pattern': 'dist/AdGuardHome_linux_amd64.tar.gz'
-        'shared': true
-        'required': true
+    'requirements':
+      - 'adg-docker': 'true'
+
+'Test e2e':
+    'artifact-subscriptions':
+      - 'artifact': 'AdGuardHome_linux_amd64'
+      - 'artifact': 'AdGuardHome frontend'
+    'docker':
+        'image': '${bamboo.dockerFrontend}'
+        'volumes':
+            '${system.YARN_DIR}': '${bamboo.cacheYarn}'
+    'key': 'E2ETEST'
+    'other':
+        'clean-working-dir': true
+    'tasks':
+      - 'checkout':
+            'force-clean-build': true
+      - 'script':
+            'interpreter': 'SHELL'
+            'scripts':
+              - |
+                #!/bin/sh
+
+                set -e -f -u -x
+
+                export CI=true
+
+                tar -xzf dist/AdGuardHome_linux_amd64.tar.gz -C /tmp
+
+                mv /tmp/AdGuardHome/AdGuardHome ./AdGuardHome
+
+                make VERBOSE=1 js-deps js-test-e2e
     'requirements':
       - 'adg-docker': 'true'
 
@@ -115,3 +224,15 @@
 'labels': []
 'other':
     'concurrent-build-plugin': 'system-default'
+
+'branch-overrides':
+    # rc-vX.Y.Z branches are the release candidate branches. They are created
+    # from the release branch and are used to build the release candidate
+    # images.
+  - '^rc-v[0-9]+\.[0-9]+\.[0-9]+':
+        # Set the default release channel on the release branch to beta, as we
+        # may need to build a few of these.
+        'variables':
+            'dockerFrontend': 'adguard/home-js-builder:2.1-bullseye'
+            'dockerGo': 'adguard/go-builder:1.24.1--1'
+            'channel': 'candidate'

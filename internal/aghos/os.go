@@ -12,34 +12,24 @@ import (
 	"os/exec"
 	"path"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
-	"github.com/AdguardTeam/golibs/mathutil"
-	"golang.org/x/exp/slices"
 )
 
-// UnsupportedError is returned by functions and methods when a particular
-// operation Op cannot be performed on the current OS.
-type UnsupportedError struct {
-	Op string
-	OS string
-}
+// Default file, binary, and directory permissions.
+const (
+	DefaultPermDir  fs.FileMode = 0o700
+	DefaultPermExe  fs.FileMode = 0o700
+	DefaultPermFile fs.FileMode = 0o600
+)
 
-// Error implements the error interface for *UnsupportedError.
-func (err *UnsupportedError) Error() (msg string) {
-	return fmt.Sprintf("%s is unsupported on %s", err.Op, err.OS)
-}
-
-// Unsupported is a helper that returns an *UnsupportedError with the Op field
-// set to op and the OS field set to the current OS.
+// Unsupported is a helper that returns a wrapped [errors.ErrUnsupported].
 func Unsupported(op string) (err error) {
-	return &UnsupportedError{
-		Op: op,
-		OS: runtime.GOOS,
-	}
+	return fmt.Errorf("%s: not supported on %s: %w", op, runtime.GOOS, errors.ErrUnsupported)
 }
 
 // SetRlimit sets user-specified limit of how many fd's we can use.
@@ -63,7 +53,7 @@ func RunCommand(command string, arguments ...string) (code int, output []byte, e
 	cmd := exec.Command(command, arguments...)
 	out, err := cmd.Output()
 
-	out = out[:mathutil.Min(len(out), MaxCmdOutputSize)]
+	out = out[:min(len(out), MaxCmdOutputSize)]
 
 	if err != nil {
 		if eerr := new(exec.ExitError); errors.As(err, &eerr) {
@@ -142,7 +132,7 @@ func parsePSOutput(r io.Reader, cmdName string, ignore []int) (largest, instNum 
 		}
 
 		instNum++
-		largest = mathutil.Max(largest, cur)
+		largest = max(largest, cur)
 	}
 	if err = s.Err(); err != nil {
 		return 0, 0, fmt.Errorf("scanning stdout: %w", err)
@@ -154,33 +144,6 @@ func parsePSOutput(r io.Reader, cmdName string, ignore []int) (largest, instNum 
 // IsOpenWrt returns true if host OS is OpenWrt.
 func IsOpenWrt() (ok bool) {
 	return isOpenWrt()
-}
-
-// RootDirFS returns the [fs.FS] rooted at the operating system's root.  On
-// Windows it returns the fs.FS rooted at the volume of the system directory
-// (usually, C:).
-func RootDirFS() (fsys fs.FS) {
-	return rootDirFS()
-}
-
-// NotifyReconfigureSignal notifies c on receiving reconfigure signals.
-func NotifyReconfigureSignal(c chan<- os.Signal) {
-	notifyReconfigureSignal(c)
-}
-
-// NotifyShutdownSignal notifies c on receiving shutdown signals.
-func NotifyShutdownSignal(c chan<- os.Signal) {
-	notifyShutdownSignal(c)
-}
-
-// IsReconfigureSignal returns true if sig is a reconfigure signal.
-func IsReconfigureSignal(sig os.Signal) (ok bool) {
-	return isReconfigureSignal(sig)
-}
-
-// IsShutdownSignal returns true if sig is a shutdown signal.
-func IsShutdownSignal(sig os.Signal) (ok bool) {
-	return isShutdownSignal(sig)
 }
 
 // SendShutdownSignal sends the shutdown signal to the channel.

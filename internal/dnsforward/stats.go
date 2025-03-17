@@ -29,7 +29,13 @@ func (s *Server) processQueryLogsAndStats(dctx *dnsContext) (rc resultCode) {
 
 	log.Debug("dnsforward: client ip for stats and querylog: %s", ipStr)
 
-	ids := []string{ipStr, dctx.clientID}
+	ids := []string{ipStr}
+	if dctx.clientID != "" {
+		// Use the ClientID first because it has a higher priority.  Filters
+		// have the same priority, see applyAdditionalFiltering.
+		ids = []string{dctx.clientID, ipStr}
+	}
+
 	qt, cl := q.Qtype, q.Qclass
 
 	// Synchronize access to s.queryLog and s.stats so they won't be suddenly
@@ -46,7 +52,7 @@ func (s *Server) processQueryLogsAndStats(dctx *dnsContext) (rc resultCode) {
 			dns.Class(cl),
 			dns.Type(qt),
 			host,
-			ip,
+			ipStr,
 		)
 	}
 
@@ -58,7 +64,7 @@ func (s *Server) processQueryLogsAndStats(dctx *dnsContext) (rc resultCode) {
 			dns.Class(cl),
 			dns.Type(qt),
 			host,
-			ip,
+			ipStr,
 		)
 	}
 
@@ -116,27 +122,35 @@ func (s *Server) logQuery(dctx *dnsContext, ip net.IP, processingTime time.Durat
 
 	if pctx.Upstream != nil {
 		p.Upstream = pctx.Upstream.Address()
-	} else if cachedUps := pctx.CachedUpstreamAddr; cachedUps != "" {
-		p.Upstream = pctx.CachedUpstreamAddr
-		p.Cached = true
+	}
+
+	if qs := pctx.QueryStatistics(); qs != nil {
+		ms := qs.Main()
+		if len(ms) == 1 && ms[0].IsCached {
+			p.Upstream = ms[0].Address
+			p.Cached = true
+		}
 	}
 
 	s.queryLog.Add(p)
 }
 
-// updatesStats writes the request into statistics.
+// updateStats writes the request data into statistics.
 func (s *Server) updateStats(dctx *dnsContext, clientIP string, processingTime time.Duration) {
 	pctx := dctx.proxyCtx
 
+	var upstreamStats []*proxy.UpstreamStatistics
+	qs := pctx.QueryStatistics()
+	if qs != nil {
+		upstreamStats = append(upstreamStats, qs.Main()...)
+		upstreamStats = append(upstreamStats, qs.Fallback()...)
+	}
+
 	e := &stats.Entry{
+		UpstreamStats:  upstreamStats,
 		Domain:         aghnet.NormalizeDomain(pctx.Req.Question[0].Name),
 		Result:         stats.RNotFiltered,
 		ProcessingTime: processingTime,
-		UpstreamTime:   pctx.QueryDuration,
-	}
-
-	if pctx.Upstream != nil {
-		e.Upstream = pctx.Upstream.Address()
 	}
 
 	if clientID := dctx.clientID; clientID != "" {

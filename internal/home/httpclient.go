@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"time"
 )
 
 // httpClient returns a new HTTP client that uses the AdGuard Home's own DNS
@@ -18,18 +17,18 @@ func httpClient() (c *http.Client) {
 	// Do not use Context.dnsServer.DialContext directly in the struct literal
 	// below, since Context.dnsServer may be nil when this function is called.
 	dialContext := func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
-		return Context.dnsServer.DialContext(ctx, network, addr)
+		return globalContext.dnsServer.DialContext(ctx, network, addr)
 	}
 
 	return &http.Client{
 		// TODO(a.garipov): Make configurable.
-		Timeout: time.Minute * 5,
+		Timeout: writeTimeout,
 		Transport: &http.Transport{
 			DialContext: dialContext,
 			Proxy:       httpProxy,
 			TLSClientConfig: &tls.Config{
-				RootCAs:      Context.tlsRoots,
-				CipherSuites: Context.tlsCipherIDs,
+				RootCAs:      globalContext.tlsRoots,
+				CipherSuites: globalContext.tlsCipherIDs,
 				MinVersion:   tls.VersionTLS12,
 			},
 		},

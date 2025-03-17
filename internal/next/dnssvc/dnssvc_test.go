@@ -1,21 +1,17 @@
 package dnssvc_test
 
 import (
-	"context"
 	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/next/dnssvc"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestMain(m *testing.M) {
-	testutil.DiscardLogOutput(m)
-}
 
 // testTimeout is the common timeout for tests.
 const testTimeout = 1 * time.Second
@@ -60,6 +56,7 @@ func TestService(t *testing.T) {
 	_, _ = testutil.RequireReceive(t, upstreamStartedCh, testTimeout)
 
 	c := &dnssvc.Config{
+		Logger:              slogutil.NewDiscardLogger(),
 		Addresses:           []netip.AddrPort{netip.MustParseAddrPort(listenAddr)},
 		BootstrapServers:    []string{upstreamSrv.PacketConn.LocalAddr().String()},
 		UpstreamServers:     []string{upstreamAddr},
@@ -72,7 +69,7 @@ func TestService(t *testing.T) {
 	svc, err := dnssvc.New(c)
 	require.NoError(t, err)
 
-	err = svc.Start()
+	err = svc.Start(testutil.ContextWithTimeout(t, testTimeout))
 	require.NoError(t, err)
 
 	gotConf := svc.Config()
@@ -94,10 +91,8 @@ func TestService(t *testing.T) {
 			}},
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-		defer cancel()
-
 		cli := &dns.Client{}
+		ctx := testutil.ContextWithTimeout(t, testTimeout)
 
 		var resp *dns.Msg
 		require.Eventually(t, func() (ok bool) {
@@ -110,10 +105,8 @@ func TestService(t *testing.T) {
 		assert.NotNil(t, resp)
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
+	err = svc.Shutdown(testutil.ContextWithTimeout(t, testTimeout))
 
-	err = svc.Shutdown(ctx)
 	require.NoError(t, err)
 
 	err = upstreamSrv.Shutdown()

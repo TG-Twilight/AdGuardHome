@@ -7,18 +7,23 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/AdGuardHome/internal/version"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/ioutil"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/netutil/urlutil"
 )
 
 // Updater is the AdGuard Home updater.
@@ -59,9 +64,22 @@ type Updater struct {
 	prevCheckResult VersionInfo
 }
 
+// DefaultVersionURL returns the default URL for the version announcement.
+func DefaultVersionURL() *url.URL {
+	return &url.URL{
+		Scheme: urlutil.SchemeHTTPS,
+		Host:   "static.adtidy.org",
+		Path:   path.Join("adguardhome", version.Channel(), "version.json"),
+	}
+}
+
 // Config is the AdGuard Home updater configuration.
 type Config struct {
 	Client *http.Client
+
+	// VersionCheckURL is URL to the latest version announcement.  It must not
+	// be nil, see [DefaultVersionURL].
+	VersionCheckURL *url.URL
 
 	Version string
 	Channel string
@@ -79,12 +97,9 @@ type Config struct {
 
 	// ExecPath is path to the executable file.
 	ExecPath string
-
-	// VersionCheckURL is url to the latest version announcement.
-	VersionCheckURL string
 }
 
-// NewUpdater creates a new Updater.
+// NewUpdater creates a new Updater.  conf must not be nil.
 func NewUpdater(conf *Config) *Updater {
 	return &Updater{
 		client: conf.Client,
@@ -99,7 +114,7 @@ func NewUpdater(conf *Config) *Updater {
 		confName:        conf.ConfName,
 		workDir:         conf.WorkDir,
 		execPath:        conf.ExecPath,
-		versionCheckURL: conf.VersionCheckURL,
+		versionCheckURL: conf.VersionCheckURL.String(),
 
 		mu: &sync.RWMutex{},
 	}
@@ -163,14 +178,6 @@ func (u *Updater) NewVersion() (nv string) {
 	defer u.mu.RUnlock()
 
 	return u.newVersion
-}
-
-// VersionCheckURL returns the version check URL.
-func (u *Updater) VersionCheckURL() (vcu string) {
-	u.mu.RLock()
-	defer u.mu.RUnlock()
-
-	return u.versionCheckURL
 }
 
 // prepare fills all necessary fields in Updater object.
@@ -239,7 +246,7 @@ func (u *Updater) unpack() error {
 func (u *Updater) check() (err error) {
 	log.Debug("updater: checking configuration")
 
-	err = copyFile(u.confName, filepath.Join(u.updateDir, "AdGuardHome.yaml"))
+	err = copyFile(u.confName, filepath.Join(u.updateDir, "AdGuardHome.yaml"), aghos.DefaultPermFile)
 	if err != nil {
 		return fmt.Errorf("copyFile() failed: %w", err)
 	}
@@ -263,9 +270,9 @@ func (u *Updater) check() (err error) {
 // ignores the configuration file if firstRun is true.
 func (u *Updater) backup(firstRun bool) (err error) {
 	log.Debug("updater: backing up current configuration")
-	_ = os.Mkdir(u.backupDir, 0o755)
+	_ = os.Mkdir(u.backupDir, aghos.DefaultPermDir)
 	if !firstRun {
-		err = copyFile(u.confName, filepath.Join(u.backupDir, "AdGuardHome.yaml"))
+		err = copyFile(u.confName, filepath.Join(u.backupDir, "AdGuardHome.yaml"), aghos.DefaultPermFile)
 		if err != nil {
 			return fmt.Errorf("copyFile() failed: %w", err)
 		}
@@ -295,8 +302,8 @@ func (u *Updater) replace() error {
 	}
 
 	if u.goos == "windows" {
-		// rename fails with "File in use" error
-		err = copyFile(u.updateExeName, u.currentExeName)
+		// Use copy, since renaming fails with "File in use" error.
+		err = copyFile(u.updateExeName, u.currentExeName, aghos.DefaultPermExe)
 	} else {
 		err = os.Rename(u.updateExeName, u.currentExeName)
 	}
@@ -314,7 +321,7 @@ func (u *Updater) clean() {
 	_ = os.RemoveAll(u.updateDir)
 }
 
-// MaxPackageFileSize is a maximum package file length in bytes. The largest
+// MaxPackageFileSize is a maximum package file length in bytes.  The largest
 // package whose size is limited by this constant currently has the size of
 // approximately 9 MiB.
 const MaxPackageFileSize = 32 * 1024 * 1024
@@ -337,12 +344,12 @@ func (u *Updater) downloadPackageFile() (err error) {
 		return fmt.Errorf("io.ReadAll() failed: %w", err)
 	}
 
-	_ = os.Mkdir(u.updateDir, 0o755)
+	_ = os.Mkdir(u.updateDir, aghos.DefaultPermDir)
 
 	log.Debug("updater: saving package to file")
-	err = os.WriteFile(u.packageName, body, 0o644)
+	err = os.WriteFile(u.packageName, body, aghos.DefaultPermFile)
 	if err != nil {
-		return fmt.Errorf("os.WriteFile() failed: %w", err)
+		return fmt.Errorf("writing package file: %w", err)
 	}
 	return nil
 }
@@ -353,24 +360,24 @@ func tarGzFileUnpackOne(outDir string, tr *tar.Reader, hdr *tar.Header) (name st
 		return "", nil
 	}
 
-	outputName := filepath.Join(outDir, name)
+	outName := filepath.Join(outDir, name)
 
 	if hdr.Typeflag == tar.TypeDir {
 		if name == "AdGuardHome" {
 			// Top-level AdGuardHome/.  Skip it.
 			//
-			// TODO(a.garipov): This whole package needs to be
-			// rewritten and covered in more integration tests.  It
-			// has weird assumptions and file mode issues.
+			// TODO(a.garipov): This whole package needs to be rewritten and
+			// covered in more integration tests.  It has weird assumptions and
+			// file mode issues.
 			return "", nil
 		}
 
-		err = os.Mkdir(outputName, os.FileMode(hdr.Mode&0o755))
+		err = os.Mkdir(outName, os.FileMode(hdr.Mode&0o755))
 		if err != nil && !errors.Is(err, os.ErrExist) {
-			return "", fmt.Errorf("os.Mkdir(%q): %w", outputName, err)
+			return "", fmt.Errorf("creating directory %q: %w", outName, err)
 		}
 
-		log.Debug("updater: created directory %q", outputName)
+		log.Debug("updater: created directory %q", outName)
 
 		return "", nil
 	}
@@ -382,13 +389,9 @@ func tarGzFileUnpackOne(outDir string, tr *tar.Reader, hdr *tar.Header) (name st
 	}
 
 	var wc io.WriteCloser
-	wc, err = os.OpenFile(
-		outputName,
-		os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
-		os.FileMode(hdr.Mode&0o755),
-	)
+	wc, err = os.OpenFile(outName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(hdr.Mode)&0o755)
 	if err != nil {
-		return "", fmt.Errorf("os.OpenFile(%s): %w", outputName, err)
+		return "", fmt.Errorf("os.OpenFile(%s): %w", outName, err)
 	}
 	defer func() { err = errors.WithDeferred(err, wc.Close()) }()
 
@@ -397,7 +400,7 @@ func tarGzFileUnpackOne(outDir string, tr *tar.Reader, hdr *tar.Header) (name st
 		return "", fmt.Errorf("io.Copy(): %w", err)
 	}
 
-	log.Debug("updater: created file %q", outputName)
+	log.Debug("updater: created file %q", outName)
 
 	return name, nil
 }
@@ -463,14 +466,13 @@ func zipFileUnpackOne(outDir string, zf *zip.File) (name string, err error) {
 		if name == "AdGuardHome" {
 			// Top-level AdGuardHome/.  Skip it.
 			//
-			// TODO(a.garipov): See the similar todo in
-			// tarGzFileUnpack.
+			// TODO(a.garipov): See the similar todo in tarGzFileUnpack.
 			return "", nil
 		}
 
 		err = os.Mkdir(outputName, fi.Mode())
 		if err != nil && !errors.Is(err, os.ErrExist) {
-			return "", fmt.Errorf("os.Mkdir(%q): %w", outputName, err)
+			return "", fmt.Errorf("creating directory %q: %w", outputName, err)
 		}
 
 		log.Debug("updater: created directory %q", outputName)
@@ -521,19 +523,26 @@ func zipFileUnpack(zipfile, outDir string) (files []string, err error) {
 	return files, err
 }
 
-// Copy file on disk
-func copyFile(src, dst string) error {
-	d, e := os.ReadFile(src)
-	if e != nil {
-		return e
+// copyFile copies a file from src to dst with the specified permissions.
+func copyFile(src, dst string, perm fs.FileMode) (err error) {
+	d, err := os.ReadFile(src)
+	if err != nil {
+		// Don't wrap the error, since it's informative enough as is.
+		return err
 	}
-	e = os.WriteFile(dst, d, 0o644)
-	if e != nil {
-		return e
+
+	err = os.WriteFile(dst, d, perm)
+	if err != nil {
+		// Don't wrap the error, since it's informative enough as is.
+		return err
 	}
+
 	return nil
 }
 
+// copySupportingFiles copies each file specified in files from srcdir to
+// dstdir.  If a file specified as a path, only the name of the file is used.
+// It skips AdGuardHome, AdGuardHome.exe, and AdGuardHome.yaml.
 func copySupportingFiles(files []string, srcdir, dstdir string) error {
 	for _, f := range files {
 		_, name := filepath.Split(f)
@@ -544,7 +553,7 @@ func copySupportingFiles(files []string, srcdir, dstdir string) error {
 		src := filepath.Join(srcdir, name)
 		dst := filepath.Join(dstdir, name)
 
-		err := copyFile(src, dst)
+		err := copyFile(src, dst, aghos.DefaultPermFile)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

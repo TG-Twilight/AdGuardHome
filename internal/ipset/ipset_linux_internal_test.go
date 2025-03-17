@@ -6,14 +6,20 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/digineo/go-ipset/v2"
 	"github.com/mdlayher/netlink"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/ti-mo/netfilter"
 )
+
+// testTimeout is a common timeout for tests and contexts.
+const testTimeout = 1 * time.Second
 
 // fakeConn is a fake ipsetConn for tests.
 type fakeConn struct {
@@ -58,7 +64,7 @@ func (c *fakeConn) listAll() (sets []props, err error) {
 }
 
 func TestManager_Add(t *testing.T) {
-	ipsetConf := []string{
+	ipsetList := []string{
 		"example.com,example.net/ipv4set",
 		"example.org,example.biz/ipv6set",
 	}
@@ -89,7 +95,11 @@ func TestManager_Add(t *testing.T) {
 		}, nil
 	}
 
-	m, err := newManagerWithDialer(ipsetConf, fakeDial)
+	conf := &Config{
+		Logger: slogutil.NewDiscardLogger(),
+		Lines:  ipsetList,
+	}
+	m, err := newManagerWithDialer(testutil.ContextWithTimeout(t, testTimeout), conf, fakeDial)
 	require.NoError(t, err)
 
 	ip4 := net.IP{1, 2, 3, 4}
@@ -100,7 +110,7 @@ func TestManager_Add(t *testing.T) {
 		0x00, 0x00, 0x56, 0x78,
 	}
 
-	n, err := m.Add("example.net", []net.IP{ip4}, nil)
+	n, err := m.Add(testutil.ContextWithTimeout(t, testTimeout), "example.net", []net.IP{ip4}, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, n)
@@ -110,7 +120,7 @@ func TestManager_Add(t *testing.T) {
 	gotIP4 := ipv4Entries[0].IP.Value
 	assert.Equal(t, ip4, gotIP4)
 
-	n, err = m.Add("example.biz", nil, []net.IP{ip6})
+	n, err = m.Add(testutil.ContextWithTimeout(t, testTimeout), "example.biz", nil, []net.IP{ip6})
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, n)
@@ -123,9 +133,6 @@ func TestManager_Add(t *testing.T) {
 	err = m.Close()
 	assert.NoError(t, err)
 }
-
-// ipsetPropsSink is the typed sink for benchmark results.
-var ipsetPropsSink []props
 
 func BenchmarkManager_LookupHost(b *testing.B) {
 	propsLong := []props{{
@@ -145,9 +152,13 @@ func BenchmarkManager_LookupHost(b *testing.B) {
 		},
 	}
 
+	var ipsetPropsSink []props
+
 	b.Run("long", func(b *testing.B) {
 		const name = "a.very.long.domain.name.inside.the.domain.example.com"
-		for i := 0; i < b.N; i++ {
+
+		b.ReportAllocs()
+		for b.Loop() {
 			ipsetPropsSink = m.lookupHost(name)
 		}
 
@@ -156,10 +167,21 @@ func BenchmarkManager_LookupHost(b *testing.B) {
 
 	b.Run("short", func(b *testing.B) {
 		const name = "example.net"
-		for i := 0; i < b.N; i++ {
+
+		b.ReportAllocs()
+		for b.Loop() {
 			ipsetPropsSink = m.lookupHost(name)
 		}
 
 		require.Equal(b, propsShort, ipsetPropsSink)
 	})
+
+	// Most recent results:
+	//
+	//	goos: linux
+	//	goarch: amd64
+	//	pkg: github.com/AdguardTeam/AdGuardHome/internal/ipset
+	//	cpu: Intel(R) Core(TM) i7-10510U CPU @ 1.80GHz
+	//	BenchmarkManager_LookupHost/long-8         	 6562424	       174.8 ns/op	       0 B/op	       0 allocs/op
+	//	BenchmarkManager_LookupHost/short-8        	100000000	        10.72 ns/op	       0 B/op	       0 allocs/op
 }

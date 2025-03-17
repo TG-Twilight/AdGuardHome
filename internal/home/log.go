@@ -1,13 +1,15 @@
 package home
 
 import (
+	"cmp"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"runtime"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/golibs/log"
-	"github.com/AdguardTeam/golibs/stringutil"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"gopkg.in/natefinch/lumberjack.v2"
 	"gopkg.in/yaml.v3"
 )
@@ -16,12 +18,30 @@ import (
 // for logger output.
 const configSyslog = "syslog"
 
-// configureLogger configures logger level and output.
-func configureLogger(opts options) (err error) {
-	ls := getLogSettings(opts)
+// newSlogLogger returns new [*slog.Logger] configured with the given settings.
+func newSlogLogger(ls *logSettings) (l *slog.Logger) {
+	if !ls.Enabled {
+		return slogutil.NewDiscardLogger()
+	}
 
-	// Configure logger level.
+	lvl := slog.LevelInfo
 	if ls.Verbose {
+		lvl = slog.LevelDebug
+	}
+
+	return slogutil.New(&slogutil.Config{
+		Format:       slogutil.FormatAdGuardLegacy,
+		Level:        lvl,
+		AddTimestamp: true,
+	})
+}
+
+// configureLogger configures logger level and output.
+func configureLogger(ls *logSettings) (err error) {
+	// Configure logger level.
+	if !ls.Enabled {
+		log.SetLevel(log.OFF)
+	} else if ls.Verbose {
 		log.SetLevel(log.DEBUG)
 	}
 
@@ -46,7 +66,7 @@ func configureLogger(opts options) (err error) {
 
 	logFilePath := ls.File
 	if !filepath.IsAbs(logFilePath) {
-		logFilePath = filepath.Join(Context.workDir, logFilePath)
+		logFilePath = filepath.Join(globalContext.workDir, logFilePath)
 	}
 
 	log.SetOutput(&lumberjack.Logger{
@@ -58,7 +78,7 @@ func configureLogger(opts options) (err error) {
 		MaxAge:     ls.MaxAge,
 	})
 
-	return nil
+	return err
 }
 
 // getLogSettings returns a log settings object properly initialized from opts.
@@ -75,7 +95,8 @@ func getLogSettings(opts options) (ls *logSettings) {
 	if opts.verbose {
 		ls.Verbose = true
 	}
-	ls.File = stringutil.Coalesce(opts.logFile, ls.File)
+
+	ls.File = cmp.Or(opts.logFile, ls.File)
 
 	if opts.runningAsService && ls.File == "" && runtime.GOOS == "windows" {
 		// When running as a Windows service, use eventlog by default if
@@ -90,7 +111,14 @@ func getLogSettings(opts options) (ls *logSettings) {
 // separate method in order to configure logger before the actual configuration
 // is parsed and applied.
 func readLogSettings() (ls *logSettings) {
-	conf := &configuration{}
+	// TODO(s.chzhen):  Add a helper function that returns default parameters
+	// for this structure and for the global configuration structure [config].
+	conf := &configuration{
+		Log: logSettings{
+			// By default, it is true if the property does not exist.
+			Enabled: true,
+		},
+	}
 
 	yamlFile, err := readConfigFile()
 	if err != nil {

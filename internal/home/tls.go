@@ -102,7 +102,9 @@ func (m *tlsManager) setCertFileTime() {
 }
 
 // start updates the configuration of t and starts it.
-func (m *tlsManager) start() {
+//
+// TODO(s.chzhen):  Use context.
+func (m *tlsManager) start(_ context.Context) {
 	m.registerWebHandlers()
 
 	m.confLock.Lock()
@@ -112,7 +114,7 @@ func (m *tlsManager) start() {
 	// The background context is used because the TLSConfigChanged wraps context
 	// with timeout on its own and shuts down the server, which handles current
 	// request.
-	Context.web.tlsConfigChanged(context.Background(), tlsConf)
+	globalContext.web.tlsConfigChanged(context.Background(), tlsConf)
 }
 
 // reload updates the configuration and restarts t.
@@ -151,7 +153,7 @@ func (m *tlsManager) reload() {
 
 	m.certLastMod = fi.ModTime().UTC()
 
-	_ = reconfigureDNSServer()
+	_ = reconfigureDNSServer(m)
 
 	m.confLock.Lock()
 	tlsConf = m.conf
@@ -160,7 +162,7 @@ func (m *tlsManager) reload() {
 	// The background context is used because the TLSConfigChanged wraps context
 	// with timeout on its own and shuts down the server, which handles current
 	// request.
-	Context.web.tlsConfigChanged(context.Background(), tlsConf)
+	globalContext.web.tlsConfigChanged(context.Background(), tlsConf)
 }
 
 // loadTLSConf loads and validates the TLS configuration.  The returned error is
@@ -440,7 +442,7 @@ func (m *tlsManager) handleTLSConfigure(w http.ResponseWriter, r *http.Request) 
 
 	onConfigModified()
 
-	err = reconfigureDNSServer()
+	err = reconfigureDNSServer(m)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusInternalServerError, "%s", err)
 
@@ -463,7 +465,7 @@ func (m *tlsManager) handleTLSConfigure(w http.ResponseWriter, r *http.Request) 
 	// same reason.
 	if restartHTTPS {
 		go func() {
-			Context.web.tlsConfigChanged(context.Background(), req.tlsConfigSettings)
+			globalContext.web.tlsConfigChanged(context.Background(), req.tlsConfigSettings)
 		}()
 	}
 }
@@ -539,7 +541,7 @@ func validateCertChain(certs []*x509.Certificate, srvName string) (err error) {
 
 	opts := x509.VerifyOptions{
 		DNSName:       srvName,
-		Roots:         Context.tlsRoots,
+		Roots:         globalContext.tlsRoots,
 		Intermediates: pool,
 	}
 	_, err = main.Verify(opts)
@@ -704,9 +706,9 @@ const (
 	keyTypeRSA     = "RSA"
 )
 
-// Attempt to parse the given private key DER block. OpenSSL 0.9.8 generates
+// Attempt to parse the given private key DER block.  OpenSSL 0.9.8 generates
 // PKCS#1 private keys by default, while OpenSSL 1.0.0 generates PKCS#8 keys.
-// OpenSSL ecparam generates SEC1 EC private keys for ECDSA. We try all three.
+// OpenSSL ecparam generates SEC1 EC private keys for ECDSA.  We try all three.
 //
 // TODO(a.garipov): Find out if this version of parsePrivateKey from the stdlib
 // is actually necessary.

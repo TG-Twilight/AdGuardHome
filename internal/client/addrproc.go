@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"log/slog"
 	"net/netip"
 	"sync"
 	"time"
@@ -10,7 +11,7 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/rdns"
 	"github.com/AdguardTeam/AdGuardHome/internal/whois"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 )
 
@@ -20,7 +21,7 @@ const ErrClosed errors.Error = "use of closed address processor"
 
 // AddressProcessor is the interface for types that can process clients.
 type AddressProcessor interface {
-	Process(ip netip.Addr)
+	Process(ctx context.Context, ip netip.Addr)
 	Close() (err error)
 }
 
@@ -31,13 +32,17 @@ type EmptyAddrProc struct{}
 var _ AddressProcessor = EmptyAddrProc{}
 
 // Process implements the [AddressProcessor] interface for EmptyAddrProc.
-func (EmptyAddrProc) Process(_ netip.Addr) {}
+func (EmptyAddrProc) Process(_ context.Context, _ netip.Addr) {}
 
 // Close implements the [AddressProcessor] interface for EmptyAddrProc.
 func (EmptyAddrProc) Close() (_ error) { return nil }
 
 // DefaultAddrProcConfig is the configuration structure for address processors.
 type DefaultAddrProcConfig struct {
+	// BaseLogger is used to create loggers with custom prefixes for sources of
+	// information about runtime clients.  It must not be nil.
+	BaseLogger *slog.Logger
+
 	// DialContext is used to create TCP connections to WHOIS servers.
 	// DialContext must not be nil if [DefaultAddrProcConfig.UseWHOIS] is true.
 	DialContext aghnet.DialContextFunc
@@ -84,12 +89,15 @@ type DefaultAddrProcConfig struct {
 type AddressUpdater interface {
 	// UpdateAddress updates information about an IP address, setting host (if
 	// not empty) and WHOIS information (if not nil).
-	UpdateAddress(ip netip.Addr, host string, info *whois.Info)
+	UpdateAddress(ctx context.Context, ip netip.Addr, host string, info *whois.Info)
 }
 
 // DefaultAddrProc processes incoming client addresses with rDNS and WHOIS, if
 // configured, and updates that information in a client storage.
 type DefaultAddrProc struct {
+	// logger is used to log the operation of address processor.
+	logger *slog.Logger
+
 	// clientIPsMu serializes closure of clientIPs and access to isClosed.
 	clientIPsMu *sync.Mutex
 
@@ -136,6 +144,7 @@ const (
 // not be nil.
 func NewDefaultAddrProc(c *DefaultAddrProcConfig) (p *DefaultAddrProc) {
 	p = &DefaultAddrProc{
+		logger:         c.BaseLogger.With(slogutil.KeyPrefix, "addrproc"),
 		clientIPsMu:    &sync.Mutex{},
 		clientIPs:      make(chan netip.Addr, defaultQueueSize),
 		rdns:           &rdns.Empty{},
@@ -147,6 +156,7 @@ func NewDefaultAddrProc(c *DefaultAddrProcConfig) (p *DefaultAddrProc) {
 
 	if c.UseRDNS {
 		p.rdns = rdns.New(&rdns.Config{
+			Logger:    c.BaseLogger.With(slogutil.KeyPrefix, "rdns"),
 			Exchanger: c.Exchanger,
 			CacheSize: defaultCacheSize,
 			CacheTTL:  defaultIPTTL,
@@ -154,13 +164,16 @@ func NewDefaultAddrProc(c *DefaultAddrProcConfig) (p *DefaultAddrProc) {
 	}
 
 	if c.UseWHOIS {
-		p.whois = newWHOIS(c.DialContext)
+		p.whois = newWHOIS(c.BaseLogger.With(slogutil.KeyPrefix, "whois"), c.DialContext)
 	}
 
-	go p.process(c.CatchPanics)
+	// TODO(s.chzhen):  Pass context.
+	ctx := context.TODO()
+
+	go p.process(ctx, c.CatchPanics)
 
 	for _, ip := range c.InitialAddresses {
-		p.Process(ip)
+		p.Process(ctx, ip)
 	}
 
 	return p
@@ -168,7 +181,7 @@ func NewDefaultAddrProc(c *DefaultAddrProcConfig) (p *DefaultAddrProc) {
 
 // newWHOIS returns a whois.Interface instance using the given function for
 // dialing.
-func newWHOIS(dialFunc aghnet.DialContextFunc) (w whois.Interface) {
+func newWHOIS(logger *slog.Logger, dialFunc aghnet.DialContextFunc) (w whois.Interface) {
 	// TODO(s.chzhen):  Consider making configurable.
 	const (
 		// defaultTimeout is the timeout for WHOIS requests.
@@ -186,6 +199,7 @@ func newWHOIS(dialFunc aghnet.DialContextFunc) (w whois.Interface) {
 	)
 
 	return whois.New(&whois.Config{
+		Logger:          logger,
 		DialContext:     dialFunc,
 		ServerAddr:      whois.DefaultServer,
 		Port:            whois.DefaultPort,
@@ -202,7 +216,7 @@ func newWHOIS(dialFunc aghnet.DialContextFunc) (w whois.Interface) {
 var _ AddressProcessor = (*DefaultAddrProc)(nil)
 
 // Process implements the [AddressProcessor] interface for *DefaultAddrProc.
-func (p *DefaultAddrProc) Process(ip netip.Addr) {
+func (p *DefaultAddrProc) Process(ctx context.Context, ip netip.Addr) {
 	p.clientIPsMu.Lock()
 	defer p.clientIPsMu.Unlock()
 
@@ -214,36 +228,42 @@ func (p *DefaultAddrProc) Process(ip netip.Addr) {
 	case p.clientIPs <- ip:
 		// Go on.
 	default:
-		log.Debug("clients: ip channel is full; len: %d", len(p.clientIPs))
+		p.logger.DebugContext(ctx, "ip channel is full", "len", len(p.clientIPs))
 	}
 }
 
 // process processes the incoming client IP-address information.  It is intended
 // to be used as a goroutine.  Once clientIPs is closed, process exits.
-func (p *DefaultAddrProc) process(catchPanics bool) {
+func (p *DefaultAddrProc) process(ctx context.Context, catchPanics bool) {
 	if catchPanics {
-		defer log.OnPanic("addrProcessor.process")
+		defer slogutil.RecoverAndLog(ctx, p.logger)
 	}
 
-	log.Info("clients: processing addresses")
+	p.logger.InfoContext(ctx, "processing addresses")
 
 	for ip := range p.clientIPs {
-		host := p.processRDNS(ip)
-		info := p.processWHOIS(ip)
+		host := p.processRDNS(ctx, ip)
+		info := p.processWHOIS(ctx, ip)
 
-		p.addrUpdater.UpdateAddress(ip, host, info)
+		p.addrUpdater.UpdateAddress(ctx, ip, host, info)
 	}
 
-	log.Info("clients: finished processing addresses")
+	p.logger.InfoContext(ctx, "finished processing addresses")
 }
 
 // processRDNS resolves the clients' IP addresses using reverse DNS.  host is
 // empty if there were errors or if the information hasn't changed.
-func (p *DefaultAddrProc) processRDNS(ip netip.Addr) (host string) {
+func (p *DefaultAddrProc) processRDNS(ctx context.Context, ip netip.Addr) (host string) {
 	start := time.Now()
-	log.Debug("clients: processing %s with rdns", ip)
+	p.logger.DebugContext(ctx, "processing rdns", "ip", ip)
 	defer func() {
-		log.Debug("clients: finished processing %s with rdns in %s", ip, time.Since(start))
+		p.logger.DebugContext(
+			ctx,
+			"finished processing rdns",
+			"ip", ip,
+			"host", host,
+			"elapsed", time.Since(start),
+		)
 	}()
 
 	ok := p.shouldResolve(ip)
@@ -251,7 +271,7 @@ func (p *DefaultAddrProc) processRDNS(ip netip.Addr) (host string) {
 		return
 	}
 
-	host, changed := p.rdns.Process(ip)
+	host, changed := p.rdns.Process(ctx, ip)
 	if !changed {
 		host = ""
 	}
@@ -268,16 +288,22 @@ func (p *DefaultAddrProc) shouldResolve(ip netip.Addr) (ok bool) {
 // processWHOIS looks up the information about clients' IP addresses in the
 // WHOIS databases.  info is nil if there were errors or if the information
 // hasn't changed.
-func (p *DefaultAddrProc) processWHOIS(ip netip.Addr) (info *whois.Info) {
+func (p *DefaultAddrProc) processWHOIS(ctx context.Context, ip netip.Addr) (info *whois.Info) {
 	start := time.Now()
-	log.Debug("clients: processing %s with whois", ip)
+	p.logger.DebugContext(ctx, "processing whois", "ip", ip)
 	defer func() {
-		log.Debug("clients: finished processing %s with whois in %s", ip, time.Since(start))
+		p.logger.DebugContext(
+			ctx,
+			"finished processing whois",
+			"ip", ip,
+			"whois", info,
+			"elapsed", time.Since(start),
+		)
 	}()
 
 	// TODO(s.chzhen):  Move the timeout logic from WHOIS configuration to the
 	// context.
-	info, changed := p.whois.Process(context.Background(), ip)
+	info, changed := p.whois.Process(ctx, ip)
 	if !changed {
 		info = nil
 	}
